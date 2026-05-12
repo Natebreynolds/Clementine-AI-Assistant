@@ -10344,7 +10344,7 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
 
   app.get('/api/metrics/usage', async (_req, res) => {
     if (!existsSync(MEMORY_DB_PATH)) {
-      res.json({ error: 'No DB', totalTokens: 0, byModel: [], bySource: [], byDay: [] });
+      res.json({ error: 'No DB', totalTokens: 0, byModel: [], bySource: [], byDay: [], byBucket: [], bucketTotals: { planCostCents: 0, extraCostCents: 0 } });
       return;
     }
     const Database = (await import('better-sqlite3')).default;
@@ -10355,20 +10355,30 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
         "SELECT name FROM sqlite_master WHERE type='table' AND name='usage_log'",
       ).get();
       if (!tableExists) {
-        res.json({ totalTokens: 0, totalInput: 0, totalOutput: 0, byModel: [], bySource: [], byDay: [] });
+        res.json({ totalTokens: 0, totalInput: 0, totalOutput: 0, byModel: [], bySource: [], byDay: [], byBucket: [], bucketTotals: { planCostCents: 0, extraCostCents: 0 } });
         return;
       }
 
+      // 1.18.183: cost_cents may not exist on older installs (added via
+      // ALTER at store.ts:675). Probe before referencing so we degrade
+      // to "no cost data" rather than erroring out.
+      const columns = new Set(
+        (db.prepare('PRAGMA table_info(usage_log)').all() as Array<{ name: string }>).map((c) => c.name),
+      );
+      const costExpr = columns.has('cost_cents') ? 'COALESCE(SUM(cost_cents), 0)' : '0';
+
       const totals = db.prepare(
         `SELECT COALESCE(SUM(input_tokens), 0) as ti, COALESCE(SUM(output_tokens), 0) as to_,
-                COALESCE(SUM(cache_read_tokens), 0) as tcr, COALESCE(SUM(cache_creation_tokens), 0) as tcc
+                COALESCE(SUM(cache_read_tokens), 0) as tcr, COALESCE(SUM(cache_creation_tokens), 0) as tcc,
+                ${costExpr} as cost
          FROM usage_log`,
-      ).get() as { ti: number; to_: number; tcr: number; tcc: number };
+      ).get() as { ti: number; to_: number; tcr: number; tcc: number; cost: number };
 
       const byModel = db.prepare(
-        `SELECT model, SUM(input_tokens) as input, SUM(output_tokens) as output, SUM(cache_read_tokens) as cacheRead
+        `SELECT model, SUM(input_tokens) as input, SUM(output_tokens) as output,
+                SUM(cache_read_tokens) as cacheRead, ${costExpr} as costCents, COUNT(*) as queries
          FROM usage_log GROUP BY model ORDER BY input DESC`,
-      ).all();
+      ).all() as Array<{ model: string; input: number; output: number; cacheRead: number; costCents: number; queries: number }>;
 
       const bySource = db.prepare(
         `SELECT source, SUM(input_tokens) as input, SUM(output_tokens) as output
@@ -10381,18 +10391,77 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
          GROUP BY date(created_at) ORDER BY day`,
       ).all();
 
+      // 1.18.183: per-bucket aggregation. Same byModel rows, classified
+      // by billing bucket (Sonnet 200K / Sonnet 1M Extra Usage / Opus /
+      // Opus 1M / Haiku) so the dashboard can render Max-meter vs
+      // Extra-Usage breakdown. See src/lib/billing-buckets.ts.
+      const { classifyBillingBucket, BUCKET_DISPLAY_ORDER } = await import('../lib/billing-buckets.js');
+      type BucketAgg = {
+        id: string;
+        label: string;
+        family: string;
+        context: string;
+        meteredOnMax: 'plan' | 'extra';
+        costCents: number;
+        inputTokens: number;
+        outputTokens: number;
+        queries: number;
+        models: string[];
+      };
+      const bucketMap = new Map<string, BucketAgg>();
+      for (const row of byModel) {
+        const b = classifyBillingBucket(row.model);
+        const existing = bucketMap.get(b.id);
+        if (existing) {
+          existing.costCents += Number(row.costCents) || 0;
+          existing.inputTokens += Number(row.input) || 0;
+          existing.outputTokens += Number(row.output) || 0;
+          existing.queries += Number(row.queries) || 0;
+          if (!existing.models.includes(row.model)) existing.models.push(row.model);
+        } else {
+          bucketMap.set(b.id, {
+            id: b.id,
+            label: b.label,
+            family: b.family,
+            context: b.context,
+            meteredOnMax: b.meteredOnMax,
+            costCents: Number(row.costCents) || 0,
+            inputTokens: Number(row.input) || 0,
+            outputTokens: Number(row.output) || 0,
+            queries: Number(row.queries) || 0,
+            models: [row.model],
+          });
+        }
+      }
+      // Render in canonical order (Extra Usage anchors last so callouts
+      // hit the eye after the in-plan rows).
+      const byBucket = BUCKET_DISPLAY_ORDER
+        .map((id) => bucketMap.get(id))
+        .filter((b): b is BucketAgg => b !== undefined);
+      const bucketTotals = byBucket.reduce(
+        (acc, b) => {
+          if (b.meteredOnMax === 'extra') acc.extraCostCents += b.costCents;
+          else acc.planCostCents += b.costCents;
+          return acc;
+        },
+        { planCostCents: 0, extraCostCents: 0 },
+      );
+
       res.json({
         totalInput: totals.ti,
         totalOutput: totals.to_,
         totalCacheRead: totals.tcr,
         totalCacheCreation: totals.tcc,
         totalTokens: totals.ti + totals.to_,
+        totalCostCents: totals.cost,
         byModel,
         bySource,
         byDay,
+        byBucket,
+        bucketTotals,
       });
     } catch (err) {
-      res.json({ error: String(err), totalTokens: 0, byModel: [], bySource: [], byDay: [] });
+      res.json({ error: String(err), totalTokens: 0, byModel: [], bySource: [], byDay: [], byBucket: [], bucketTotals: { planCostCents: 0, extraCostCents: 0 } });
     } finally {
       db.close();
     }
@@ -36881,6 +36950,16 @@ function formatTokens(n) {
   return String(n);
 }
 
+// 1.18.183: dollars for the billing-bucket panel. Cents in, "$X.XX"
+// out. Sub-cent values render as "<$0.01" so a tiny but nonzero
+// Extra Usage line still reads as "you have exposure" rather than "$0".
+function formatCents(cents) {
+  var c = Number(cents) || 0;
+  if (c === 0) return '$0.00';
+  if (c > 0 && c < 1) return '<$0.01';
+  return '$' + (c / 100).toFixed(2);
+}
+
 function formatBytes(n) {
   if (n == null) return '—';
   if (n < 1024) return n + ' B';
@@ -38291,6 +38370,65 @@ async function refreshMetrics() {
     var cacheEff = u.totalInput > 0 ? Math.round(((u.totalCacheRead || 0) / u.totalInput) * 100) : 0;
     html += statTile(cacheEff + '%', 'Cache Hit Rate', cacheEff >= 50 ? 'var(--green)' : cacheEff >= 20 ? 'var(--yellow)' : 'var(--text-muted)');
     html += '</div>';
+
+    // 1.18.183: Spend by Billing Bucket — separates Max-covered usage
+    // from Extra Usage exposure (Sonnet [1m] etc.). Surfaces the bucket
+    // a model lives in, not just its token count, so a quiet Sonnet
+    // meter no longer hides rising weekly spend on a separate billing
+    // line. See src/lib/billing-buckets.ts.
+    if (u.byBucket && u.byBucket.length > 0) {
+      var planCost = (u.bucketTotals && u.bucketTotals.planCostCents) || 0;
+      var extraCost = (u.bucketTotals && u.bucketTotals.extraCostCents) || 0;
+      var totalCost = planCost + extraCost;
+      var hasExtra = extraCost > 0;
+
+      html += '<div class="card" style="margin-top:16px"><div class="card-header">'
+        + 'Spend by Billing Bucket'
+        + '<span style="float:right;font-size:11px;color:var(--text-muted);font-weight:400">'
+        + 'In-plan ' + esc(formatCents(planCost))
+        + ' &middot; Extra Usage ' + (hasExtra
+          ? '<span style="color:var(--orange,#f80);font-weight:600">' + esc(formatCents(extraCost)) + '</span>'
+          : esc(formatCents(extraCost)))
+        + '</span></div><div class="card-body">';
+
+      // Banner when Extra Usage > 0 — this is the whole point of the
+      // panel. Max plans don't comp Sonnet [1m]; surfacing it here means
+      // the user can spot it without checking the Anthropic Console.
+      if (hasExtra) {
+        html += '<div style="margin-bottom:12px;padding:10px 12px;border-radius:6px;'
+          + 'background:rgba(255,128,0,0.08);border-left:3px solid var(--orange,#f80);'
+          + 'font-size:12px;line-height:1.5">'
+          + '<strong>Extra Usage detected.</strong> '
+          + esc(formatCents(extraCost))
+          + ' of recent spend is on the Anthropic Extra Usage path (typically Sonnet 1M), '
+          + 'which is <strong>not</strong> covered by Max / Team / Enterprise subscriptions. '
+          + 'Switch heavy autonomous skills to <code>claude-opus-4-7[1m]</code> via skill frontmatter '
+          + '<code>clementine.limits.model</code>, or drop <code>[1m]</code> to stay on the standard Sonnet meter.'
+          + '</div>';
+      }
+
+      var maxBucketCost = Math.max.apply(null, u.byBucket.map(function(b) { return b.costCents || 0; }).concat([1]));
+      for (var bi = 0; bi < u.byBucket.length; bi++) {
+        var bk = u.byBucket[bi];
+        var bkPct = maxBucketCost > 0 ? Math.round(((bk.costCents || 0) / maxBucketCost) * 100) : 0;
+        var bkColor = bk.meteredOnMax === 'extra' ? 'var(--orange,#f80)'
+          : (bk.family === 'opus' ? 'var(--purple)'
+            : (bk.family === 'sonnet' ? 'var(--blue)'
+              : (bk.family === 'haiku' ? 'var(--green)' : 'var(--text-muted)')));
+        var bkShareNum = totalCost > 0 ? Math.round(((bk.costCents || 0) / totalCost) * 100) : 0;
+        html += '<div style="margin-bottom:10px">'
+          + '<div class="kv-row">'
+          + '<span class="kv-key">' + esc(bk.label) + '</span>'
+          + '<span class="kv-val" title="' + esc(formatTokens(bk.inputTokens || 0)) + ' input &middot; ' + esc(formatTokens(bk.outputTokens || 0)) + ' output &middot; ' + (bk.queries || 0) + ' calls">'
+          + esc(formatCents(bk.costCents || 0))
+          + '<span style="color:var(--text-muted);font-size:11px;margin-left:6px">' + bkShareNum + '%</span>'
+          + '</span>'
+          + '</div>'
+          + '<div class="metric-bar-track"><div class="metric-bar-fill" style="width:' + bkPct + '%;background:' + bkColor + '"></div></div>'
+          + '</div>';
+      }
+      html += '</div></div>';
+    }
 
     // Tokens by Model
     if (u.byModel && u.byModel.length > 0) {
