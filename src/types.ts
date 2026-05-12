@@ -342,6 +342,7 @@ export interface BackgroundTask {
   resultPath?: string;        // Full result markdown when result was too large for JSON
   error?: string;             // If status='failed', 'aborted', or 'interrupted'
   deliverableNote?: string;   // Optional vault path produced by the run
+  mirroredAt?: string;        // ISO when the delivery was mirrored into chat memory (idempotency flag for the startup backfill)
 }
 
 // ── Per-agent heartbeat ──────────────────────────────────────────────

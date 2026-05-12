@@ -984,6 +984,20 @@ async function asyncMain(): Promise<void> {
     logger.warn({ err }, 'Background task hygiene check failed — non-fatal');
   }
 
+  // Backfill orphaned bg-task deliveries into chat memory. Picks up any
+  // task that finished in the last 7 days whose lifecycle message was
+  // never mirrored (e.g. completed before 1.18.180 wired the mirror, or
+  // while the daemon was down). Idempotent via the `mirroredAt` flag on
+  // each task file — safe to run on every boot.
+  try {
+    const result = cronScheduler.mirrorOrphanedBackgroundDeliveries();
+    if (result.mirrored > 0) {
+      logger.info({ count: result.mirrored }, 'Backfilled orphaned background task deliveries into chat memory');
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Background-task delivery backfill failed — non-fatal');
+  }
+
   const timerInterval = startTimerChecker(dispatcher, gateway);
 
   // Start brain ingest scheduler (polls registered REST sources on their cron)

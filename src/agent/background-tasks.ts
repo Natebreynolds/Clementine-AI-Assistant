@@ -237,6 +237,49 @@ export function interruptStaleRunningTasks(opts?: BackgroundTaskOptions): number
 /** Backward-compatible export for callers/tests using the old name. */
 export const abortStaleRunningTasks = interruptStaleRunningTasks;
 
+/**
+ * Find background tasks whose lifecycle messages were never mirrored into
+ * the originating chat session's memory — typically because they completed
+ * before 1.18.180 wired the mirror, or because the daemon was down when the
+ * delivery would have fired. Returns terminal-state tasks (done / failed /
+ * interrupted / aborted) that:
+ *   - have a sessionKey (so we know where to mirror them)
+ *   - lack a `mirroredAt` flag (haven't been mirrored yet)
+ *   - completed within the recency window (default: last 7 days)
+ *
+ * Caller (typically the cron-scheduler on daemon start) is responsible for
+ * doing the actual mirror via gateway.injectContext and then stamping each
+ * task with `markBackgroundTaskMirrored(id)`. Keeping the injection out of
+ * this module avoids a dependency cycle on the gateway.
+ */
+export function findUnmirroredDeliveries(
+  opts?: BackgroundTaskOptions & { sinceMs?: number },
+): BackgroundTask[] {
+  const sinceMs = opts?.sinceMs ?? 7 * 24 * 60 * 60_000;
+  const cutoff = Date.now() - sinceMs;
+  const terminal: Array<BackgroundTask['status']> = ['done', 'failed', 'interrupted', 'aborted'];
+  const out: BackgroundTask[] = [];
+  for (const status of terminal) {
+    for (const task of listBackgroundTasks({ status }, opts)) {
+      if (task.mirroredAt) continue;          // already mirrored on a prior boot
+      if (!task.sessionKey) continue;          // no chat to mirror back to
+      const stampIso = task.completedAt ?? task.interruptedAt ?? task.createdAt;
+      const stamp = Date.parse(stampIso ?? '');
+      if (Number.isFinite(stamp) && stamp < cutoff) continue;
+      out.push(task);
+    }
+  }
+  return out;
+}
+
+/** Stamp `mirroredAt` so future boots don't re-mirror the same delivery. */
+export function markBackgroundTaskMirrored(id: string, opts?: BackgroundTaskOptions): void {
+  const task = loadBackgroundTask(id, opts);
+  if (!task) return;
+  task.mirroredAt = new Date().toISOString();
+  safeWrite(pathFor(id, opts), task);
+}
+
 /** Delete a task file. Callers should avoid deleting active tasks. */
 export function deleteBackgroundTask(id: string, opts?: BackgroundTaskOptions): void {
   try {

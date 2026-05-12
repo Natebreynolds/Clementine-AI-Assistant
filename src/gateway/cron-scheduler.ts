@@ -67,8 +67,10 @@ import { loadPromptOverridesForJob, watchPromptOverrides } from '../agent/prompt
 import { logAuditJsonl } from '../agent/hooks.js';
 import type { ProactiveDecision } from '../agent/proactive-engine.js';
 import {
+  findUnmirroredDeliveries,
   listBackgroundTasks,
   loadBackgroundTask,
+  markBackgroundTaskMirrored,
   markDone as markBgTaskDone,
   markFailed as markBgTaskFailed,
   markRunning as markBgTaskRunning,
@@ -1066,11 +1068,15 @@ export class CronScheduler {
    * any record of a Netlify site." injectContext writes into both the
    * pending-context map (visible to the next SDK turn) and the memory
    * store (searchable later by the assistant).
+   *
+   * If `taskId` is provided, stamps the task with `mirroredAt` so the
+   * startup backfill won't replay it on the next daemon restart.
    */
   private mirrorBackgroundTaskToChat(
     sessionKey: string | undefined,
     userTextPlaceholder: string,
     assistantText: string,
+    taskId?: string,
   ): void {
     if (!sessionKey) return;
     try {
@@ -1079,9 +1085,43 @@ export class CronScheduler {
         model: 'bg-task',
         countExchange: true,
       });
+      if (taskId) {
+        try { markBackgroundTaskMirrored(taskId); }
+        catch { /* non-fatal */ }
+      }
     } catch (err) {
       logger.debug({ err, sessionKey }, 'Failed to mirror background task message into chat memory');
     }
+  }
+
+  /**
+   * Boot-time backfill. Mirrors any terminal-state background task whose
+   * lifecycle message never landed in the originating chat session's
+   * memory — typically because it finished before 1.18.180 wired the
+   * mirror, or because the daemon was down when delivery would have
+   * fired. Idempotent via the `mirroredAt` flag on each task file.
+   */
+  public mirrorOrphanedBackgroundDeliveries(): { mirrored: number } {
+    let mirrored = 0;
+    try {
+      for (const task of findUnmirroredDeliveries()) {
+        const promptSnippet = (task.prompt ?? '').slice(0, 200);
+        const headSummary = `${task.id} (${task.status})`;
+        const body = (task.result ?? task.error ?? '(no saved output)').slice(0, 1500);
+        const placeholder = `[Background task ${headSummary} delivered: ${promptSnippet}]`;
+        const message = task.status === 'done'
+          ? `**Background task ${task.id} done** — ${promptSnippet}\n\n${body}`
+          : `**Background task ${task.id} ${task.status}** — ${promptSnippet}\n\n${body}`;
+        this.mirrorBackgroundTaskToChat(task.sessionKey, placeholder, message, task.id);
+        mirrored++;
+      }
+      if (mirrored > 0) {
+        logger.info({ mirrored }, 'Mirrored orphaned background task deliveries into chat memory');
+      }
+    } catch (err) {
+      logger.warn({ err }, 'Background-task backfill failed — non-fatal');
+    }
+    return { mirrored };
   }
 
   /** Same idea for workflows. Workflows can be agent-scoped via WorkflowDefinition.agentSlug. */
@@ -2157,6 +2197,9 @@ export class CronScheduler {
       // memory so the assistant remembers it has a task running. Without
       // this, the next chat turn the user sends comes back to a session
       // that has no idea any bg: work was ever queued.
+      // Note: we do NOT stamp `mirroredAt` here — that's reserved for the
+      // terminal-state mirror (done/failed) so the backfill only counts
+      // deliveries, not intent-to-run.
       this.mirrorBackgroundTaskToChat(
         started.sessionKey,
         `[Background task ${started.id} queued: ${started.prompt.slice(0, 200)}]`,
@@ -2213,11 +2256,14 @@ export class CronScheduler {
           .catch((err) => logger.debug({ err, id: started.id }, 'Failed to dispatch background task result'));
         // Mirror into chat memory so a follow-up like "fix the site"
         // doesn't get a blank stare — the assistant needs to remember
-        // it just deployed something and where it lives.
+        // it just deployed something and where it lives. Stamp
+        // `mirroredAt` so the startup backfill won't replay this on the
+        // next restart.
         this.mirrorBackgroundTaskToChat(
           completed.sessionKey,
           `[Background task ${completed.id} delivered: ${started.prompt.slice(0, 200)}]`,
           deliveryMessage,
+          completed.id,
         );
       }).catch((err) => {
         clearInterval(progressTimer);
@@ -2238,6 +2284,7 @@ export class CronScheduler {
           failed.sessionKey,
           `[Background task ${failed.id} failed: ${started.prompt.slice(0, 200)}]`,
           failMessage,
+          failed.id,
         );
       });
     }
@@ -2669,6 +2716,18 @@ export class CronScheduler {
           `**[Workflow: ${name}]**\n\n${response.slice(0, 1500)}`,
           this.dispatchContextForWorkflow(name),
         );
+        // Mirror under a workflow-scoped session so semantic search can
+        // surface this run regardless of who triggered it.
+        try {
+          this.gateway.injectContext(
+            `workflow:${name}`,
+            `[Workflow ${name} ran]`,
+            response,
+            { pending: false, model: 'workflow', countExchange: true },
+          );
+        } catch (err) {
+          logger.debug({ err, workflow: name }, 'workflow transcript mirror failed (non-fatal)');
+        }
         // Inject into owner's DM session
         if (DISCORD_OWNER_ID && DISCORD_OWNER_ID !== '0') {
           this.gateway.injectContext(
@@ -2687,6 +2746,18 @@ export class CronScheduler {
       logger.error({ err, workflow: name }, `Workflow '${name}' failed`);
       const errMsg = `Workflow '${name}' failed: ${String(err).slice(0, 300)}`;
       await this.dispatcher.send(errMsg, this.dispatchContextForWorkflow(name));
+      // Mirror failures into memory too — "what happened to that workflow?"
+      // should find something instead of nothing.
+      try {
+        this.gateway.injectContext(
+          `workflow:${name}`,
+          `[Workflow ${name} failed]`,
+          errMsg,
+          { pending: false, model: 'workflow', countExchange: true },
+        );
+      } catch (mirrorErr) {
+        logger.debug({ err: mirrorErr, workflow: name }, 'workflow failure mirror failed (non-fatal)');
+      }
       return errMsg;
     } finally {
       this.runningWorkflows.delete(name);
