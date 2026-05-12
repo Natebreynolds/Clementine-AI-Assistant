@@ -41,6 +41,7 @@ import {
   currentTimeZone,
   looksLikeClaudeOneMillionContextError,
   normalizeClaudeSdkOptionsForOneMillionContext,
+  setEnvOverride,
 } from '../config.js';
 import { parseTasks } from '../tools/shared.js';
 // 1.18.160 — also pull parseCronJobs + parseAgentCronJobs so getCronJobs()
@@ -8418,6 +8419,11 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       content = content.trimEnd() + `\n${key}=${value}\n`;
     }
     writeFileSync(ENV_PATH, content, { mode: 0o600 });
+    // Always mirror the disk write into the live env cache. Without this,
+    // BUDGET.* and any other getEnv-backed config stays at the value it
+    // was first read with — that's how "Saved $0 in the dashboard" can
+    // coexist with "Hit the $1.00 cron budget cap" in the same minute.
+    setEnvOverride(key, value);
   }
 
   function deleteEnvValue(key: string): void {
@@ -8425,6 +8431,9 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     const re = new RegExp(`^${key}=.*\n?`, 'm');
     const content = readFileSync(ENV_PATH, 'utf-8').replace(re, '');
     writeFileSync(ENV_PATH, content, { mode: 0o600 });
+    // Mirror the delete so live readers don't keep seeing the cached value.
+    setEnvOverride(key, '');
+    delete process.env[key];
   }
 
   const DASHBOARD_BUDGET_ROWS = [
@@ -8480,8 +8489,9 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       return { ok: false, error: 'Budget cap is too high for the dashboard. Use the CLI if you really need a cap above $1000.' };
     }
     const normalized = n === 0 ? '0' : String(Math.round(n * 100) / 100);
+    // `writeEnvValue` mirrors into the live env cache, so BUDGET.* (now
+    // backed by getters) sees the new value on the very next tool call.
     writeEnvValue(key, normalized);
-    process.env[key] = normalized;
     return { ok: true, value: normalized };
   }
 
@@ -8725,7 +8735,7 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       }
       res.json({
         ok: true,
-        message: `${key} set to ${formatDashboardBudgetValue(result.value)}. Restart Clementine to apply to running workers.`,
+        message: `${key} set to ${formatDashboardBudgetValue(result.value)}. Applied to running workers immediately.`,
       });
     } catch (err) {
       res.status(500).json({ error: String(err) });
@@ -8739,10 +8749,10 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       let message: string;
       if (preset === 'defaults' || preset === 'standard') {
         writes = DASHBOARD_BUDGET_ROWS.map(row => ({ key: row.key, value: row.value }));
-        message = 'Restored the standard spend caps. Restart Clementine to apply to running workers.';
+        message = 'Restored the standard spend caps. Applied to running workers immediately.';
       } else if (preset === 'uncapped' || preset === 'off' || preset === 'none') {
         writes = DASHBOARD_BUDGET_ROWS.map(row => ({ key: row.key, value: '0' }));
-        message = 'Removed spend caps by setting all budget values to 0. Restart Clementine for the change to take effect on running workers. (1M context mode is separate — use Force 200K or Safe Recovery for 1M errors.)';
+        message = 'Removed spend caps by setting all budget values to 0. Applied to running workers immediately. (1M context mode is separate — use Force 200K or Safe Recovery for 1M errors.)';
       } else {
         res.status(400).json({ error: 'preset must be defaults or uncapped' });
         return;

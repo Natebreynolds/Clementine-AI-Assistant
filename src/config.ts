@@ -342,6 +342,21 @@ export function envSnapshot(): Record<string, string | undefined> {
   return { ...process.env, ...env };
 }
 
+/**
+ * Hot-update a config value at runtime. Call this from any code path that
+ * persists a config change (e.g. dashboard `/api/budgets/set`) so the
+ * in-module `env` cache stays in sync with what's on disk + in process.env.
+ *
+ * Without this, `getEnv` keeps returning the value that was read from .env
+ * at module init and frozen objects like BUDGET stay stale until the
+ * daemon restarts — that's how a "Budgets at zero in the dashboard" UI can
+ * coexist with a `Hit the $1.00 cron budget cap` error on the same minute.
+ */
+export function setEnvOverride(key: string, value: string): void {
+  env[key] = value;
+  process.env[key] = value;
+}
+
 /** Test-only: clear the keychain ref cache so re-resolution can be tested. */
 export function _resetKeychainRefCache(): void {
   resolvedKeychainRefs.clear();
@@ -454,16 +469,19 @@ export const MODELS: Models = {
 // (writes to ~/.clementine/.env, survives npm update -g) or via
 // `budgets.*` keys in clementine.json.
 
+// Live getters — each property re-reads .env + process.env on access so a
+// dashboard write (via setEnvOverride) takes effect on the *next* tool call
+// without needing a daemon restart. Defaults match the previous fixed values.
 export const BUDGET = {
-  heartbeat: getEnvOrJsonNumber('BUDGET_HEARTBEAT_USD', json.budgets?.heartbeat, 0.25), // per heartbeat (Haiku)
-  cronT1: getEnvOrJsonNumber('BUDGET_CRON_T1_USD', json.budgets?.cronT1, 0.75),         // per tier-1 cron job
-  cronT2: getEnvOrJsonNumber('BUDGET_CRON_T2_USD', json.budgets?.cronT2, 1.50),         // per tier-2 cron job
-  chat: getEnvOrJsonNumber('BUDGET_CHAT_USD', json.budgets?.chat, 5.00),                // per interactive chat
-  unleashedPhase: undefined,
-  memoryExtraction: undefined,
-  summarization: undefined,
-  reflection: undefined,
-};
+  get heartbeat() { return getEnvOrJsonNumber('BUDGET_HEARTBEAT_USD', json.budgets?.heartbeat, 0.25); },
+  get cronT1() { return getEnvOrJsonNumber('BUDGET_CRON_T1_USD', json.budgets?.cronT1, 0.75); },
+  get cronT2() { return getEnvOrJsonNumber('BUDGET_CRON_T2_USD', json.budgets?.cronT2, 1.50); },
+  get chat() { return getEnvOrJsonNumber('BUDGET_CHAT_USD', json.budgets?.chat, 5.00); },
+  unleashedPhase: undefined as number | undefined,
+  memoryExtraction: undefined as number | undefined,
+  summarization: undefined as number | undefined,
+  reflection: undefined as number | undefined,
+} as const;
 
 // ── Memory janitor (bounded-growth maintenance) ─────────────────────
 // Two-phase delete: consolidated chunks with low salience and no recent
