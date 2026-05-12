@@ -14,6 +14,7 @@ import pino from 'pino';
 import {
   BASE_DIR,
   applyOneMillionContextRecovery,
+  claudeCodeSystemPrompt,
   looksLikeClaudeOneMillionContextError,
   normalizeClaudeSdkOptionsForOneMillionContext,
 } from '../config.js';
@@ -520,7 +521,8 @@ export async function probeAvailableTools(force = false): Promise<ToolInventory>
     const stream = query({
       prompt: 'ok',
       options: normalizeClaudeSdkOptionsForOneMillionContext({
-        systemPrompt: 'Reply ok.',
+        // 1.18.192 — preset form for Claude Code subscription auth.
+        systemPrompt: claudeCodeSystemPrompt('Reply ok.', { minimal: true }),
         model: 'claude-haiku-4-5',
         permissionMode: 'dontAsk' as const,
         mcpServers: externalMcpServers,

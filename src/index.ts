@@ -706,7 +706,12 @@ async function asyncMain(): Promise<void> {
             options: config.normalizeClaudeSdkOptionsForOneMillionContext({
               model: 'claude-haiku-4-5-20251001',
               maxTurns: 1,
-              systemPrompt: 'You are a memory consolidation assistant. Be concise.',
+              // 1.18.192 — preset form so SDK uses Claude Code subscription
+              // auth (raw string → API-key path → "Not logged in" for Max users).
+              systemPrompt: config.claudeCodeSystemPrompt(
+                'You are a memory consolidation assistant. Be concise.',
+                { minimal: true },
+              ),
             }),
           });
           for await (const msg of stream) {

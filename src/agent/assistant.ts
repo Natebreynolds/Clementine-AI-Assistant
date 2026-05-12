@@ -49,6 +49,7 @@ import {
   CLAUDE_CODE_OAUTH_TOKEN,
   ANTHROPIC_API_KEY as CONFIG_ANTHROPIC_API_KEY,
   claudeCodeDisableOneMillionForModel,
+  claudeCodeSystemPrompt,
   currentOneMillionContextMode,
   normalizeClaudeModelForOneMillionContext,
   normalizeClaudeSdkOptionsForOneMillionContext,
@@ -3200,7 +3201,13 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       const stream = query({
         prompt: memPrompt,
         options: {
-          systemPrompt: 'You are a silent memory extraction agent. Save facts to the vault and exit.',
+          // 1.18.192 — preset form so Haiku call uses Claude Code subscription
+          // auth. Without this, every chat exchange's auto-memory extractor
+          // hit "Not logged in" silently in the background.
+          systemPrompt: claudeCodeSystemPrompt(
+            'You are a silent memory extraction agent. Save facts to the vault and exit.',
+            { minimal: true },
+          ),
           model: AUTO_MEMORY_MODEL,
           permissionMode: 'dontAsk',
           // MCP tool names live in allowedTools, not tools. See note at
@@ -3492,7 +3499,13 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       const stream = query({
         prompt: reflectionPrompt,
         options: {
-          systemPrompt: 'You are a task output verifier. Assess the output quality.',
+          // 1.18.192 — preset form so the verifier authenticates via the
+          // Claude Code subscription. Every cron-job reflection was silently
+          // skipping verification before this fix.
+          systemPrompt: claudeCodeSystemPrompt(
+            'You are a task output verifier. Assess the output quality.',
+            { minimal: true },
+          ),
           model: MODELS.haiku,
           permissionMode: 'dontAsk',
           tools: [],

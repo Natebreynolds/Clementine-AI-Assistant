@@ -19,6 +19,7 @@ import { contentHash } from './common.js';
 import {
   MODELS,
   applyOneMillionContextRecovery,
+  claudeCodeSystemPrompt,
   looksLikeClaudeOneMillionContextError,
   normalizeClaudeSdkOptionsForOneMillionContext,
 } from '../../config.js';
@@ -101,7 +102,13 @@ async function ocrPdfViaClaude(filePath: string): Promise<string[]> {
       options: normalizeClaudeSdkOptionsForOneMillionContext({
         model: MODELS.haiku,
         maxTurns: 4, // Read tool call + response (a few turns of thinking is fine)
-        systemPrompt: 'You are a faithful OCR transcriber. Copy text exactly as written. When the PDF has images or scans, read the text from them using vision. Never invent content.',
+        // 1.18.192 — preset form for Claude Code subscription auth.
+        // Without this, every scanned-PDF ingest hit "Not logged in" and
+        // silently fell back to empty OCR output.
+        systemPrompt: claudeCodeSystemPrompt(
+          'You are a faithful OCR transcriber. Copy text exactly as written. When the PDF has images or scans, read the text from them using vision. Never invent content.',
+          { minimal: true },
+        ),
         // Claude Code's built-in Read tool handles PDFs (text + vision)
         tools: ['Read'],
         allowedTools: ['Read'],

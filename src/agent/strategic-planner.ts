@@ -18,6 +18,7 @@ import {
   GOALS_DIR,
   MODELS,
   applyOneMillionContextRecovery,
+  claudeCodeSystemPrompt,
   looksLikeClaudeOneMillionContextError,
   normalizeClaudeSdkOptionsForOneMillionContext,
 } from '../config.js';
@@ -59,7 +60,11 @@ async function llmJsonCall(prompt: string, systemPrompt: string): Promise<string
     options: normalizeClaudeSdkOptionsForOneMillionContext({
       model: MODELS.haiku,
       maxTurns: 1,
-      systemPrompt,
+      // 1.18.192 — preset form so the SDK uses Claude Code subscription auth.
+      // Raw `systemPrompt: string` triggers API-key auth and "Not logged in"
+      // failures on Max-only installs. Logs confirmed weekly review was
+      // silently falling through to the fallback path here since the bug landed.
+      systemPrompt: claudeCodeSystemPrompt(systemPrompt, { minimal: true }),
     }),
   });
   for await (const msg of stream) {

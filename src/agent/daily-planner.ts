@@ -16,6 +16,7 @@ import {
   INBOX_DIR,
   MODELS,
   applyOneMillionContextRecovery,
+  claudeCodeSystemPrompt,
   looksLikeClaudeOneMillionContextError,
   normalizeClaudeSdkOptionsForOneMillionContext,
 } from '../config.js';
@@ -270,7 +271,12 @@ Rules:
         options: normalizeClaudeSdkOptionsForOneMillionContext({
           model: MODELS.haiku,
           maxTurns: 1,
-          systemPrompt: 'You are a planning assistant. Analyze the context and produce a prioritized daily plan as JSON. Return only valid JSON, no markdown fencing.',
+          // 1.18.192 — preset form so SDK uses Claude Code subscription auth
+          // (raw string → API-key auth → "Not logged in" failure for Max users).
+          systemPrompt: claudeCodeSystemPrompt(
+            'You are a planning assistant. Analyze the context and produce a prioritized daily plan as JSON. Return only valid JSON, no markdown fencing.',
+            { minimal: true },
+          ),
         }),
       });
       for await (const msg of stream) {

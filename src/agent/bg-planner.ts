@@ -45,7 +45,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import pino from 'pino';
-import { BASE_DIR, MODELS, applyOneMillionContextRecovery, looksLikeClaudeOneMillionContextError, normalizeClaudeSdkOptionsForOneMillionContext } from '../config.js';
+import { BASE_DIR, MODELS, applyOneMillionContextRecovery, claudeCodeSystemPrompt, looksLikeClaudeOneMillionContextError, normalizeClaudeSdkOptionsForOneMillionContext } from '../config.js';
 import type { ProjectMeta } from './assistant.js';
 
 const logger = pino({ name: 'clementine.bg-planner' });
@@ -345,12 +345,25 @@ function buildPlannerUserPrompt(opts: PlanRequestOptions): string {
 async function runPlannerLlm(userPrompt: string, systemPrompt: string, model: string): Promise<string> {
   const { query } = await import('@anthropic-ai/claude-agent-sdk');
   let text = '';
+  // 1.18.192 — CRITICAL: use the `claude_code` preset for systemPrompt
+  // so this query uses Claude Code subscription auth (Max plan etc.).
+  // Raw `systemPrompt: string` tells the SDK to use API-key auth, which
+  // 99% of installs don't have configured — they're logged into Claude
+  // Code, not the Anthropic API. This was the "Not logged in · Please
+  // run /login" failure Ross's owner hit on 2026-05-12.
+  //
+  // The preset injects Claude Code's default system prompt; our planning
+  // instructions go in `append` and dominate behavior for the single
+  // turn (maxTurns: 1, so no agentic loop where bleed could compound).
   const stream = query({
     prompt: userPrompt,
     options: normalizeClaudeSdkOptionsForOneMillionContext({
       model,
       maxTurns: 1, // single shot — emit JSON, done
-      systemPrompt,
+      // Planner uses the full preset (not `minimal`) — the planner benefits
+      // from knowing the working directory + git status so it can decompose
+      // accurately. See claudeCodeSystemPrompt() in config.ts.
+      systemPrompt: claudeCodeSystemPrompt(systemPrompt),
     }),
   });
   for await (const msg of stream) {

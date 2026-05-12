@@ -36,7 +36,11 @@ async function parseWith(content: string) {
   return parseCronJobs();
 }
 
-describe('CRON.md field parsing (1.18.185)', () => {
+// 1.18.192 — bump describe-level timeout: parseCronJobs imports
+// cron-scheduler.js whose transitive imports (gateway/router → assistant)
+// take >5s the first time the suite warms them up. The test logic itself
+// is sub-second; just need to absorb the cold-import cost.
+describe('CRON.md field parsing (1.18.185)', { timeout: 30000 }, () => {
   it('parses per-job model override', async () => {
     const jobs = await parseWith(`---
 jobs:

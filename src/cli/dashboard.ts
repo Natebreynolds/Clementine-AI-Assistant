@@ -39,6 +39,7 @@ import {
   SESSIONS_FILE,
   TIMEZONE,
   applyOneMillionContextRecovery,
+  claudeCodeSystemPrompt,
   currentTimeZone,
   looksLikeClaudeOneMillionContextError,
   normalizeClaudeSdkOptionsForOneMillionContext,
@@ -6121,7 +6122,11 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
         options: normalizeClaudeSdkOptionsForOneMillionContext({
           model: MODELS.haiku,
           maxTurns: 3,
-          systemPrompt: 'You are a data enumerator. You call the given tool once, extract the items from its response, and emit a strict JSON array. No commentary.',
+          // 1.18.192 — preset form for Claude Code subscription auth.
+          systemPrompt: claudeCodeSystemPrompt(
+            'You are a data enumerator. You call the given tool once, extract the items from its response, and emit a strict JSON array. No commentary.',
+            { minimal: true },
+          ),
           allowedTools: [tool],
           mcpServers,
           permissionMode: 'dontAsk' as const,
@@ -9428,7 +9433,11 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
             options: normalizeClaudeSdkOptionsForOneMillionContext({
               model: 'claude-haiku-4-5-20251001',
               maxTurns: 1,
-              systemPrompt: 'You are a memory consolidation assistant. Extract only facts directly evidenced by the corpus. Be terse. Output exactly the requested format.',
+              // 1.18.192 — preset form for Claude Code subscription auth.
+              systemPrompt: claudeCodeSystemPrompt(
+                'You are a memory consolidation assistant. Extract only facts directly evidenced by the corpus. Be terse. Output exactly the requested format.',
+                { minimal: true },
+              ),
             }),
           });
           for await (const msg of stream) {

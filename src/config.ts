@@ -234,6 +234,43 @@ export function normalizeClaudeSdkOptionsForOneMillionContext<T extends ClaudeSd
   return next as T;
 }
 
+/**
+ * 1.18.192 — Build a `systemPrompt` value that uses the `claude_code` preset
+ * so the SDK query authenticates via Claude Code subscription (Max plan,
+ * CLAUDE_CODE_OAUTH_TOKEN) instead of falling back to ANTHROPIC_API_KEY.
+ *
+ * Why this matters: passing `systemPrompt` as a raw string tells the SDK
+ * "custom prompt, no preset" — which silently routes auth to API-key mode.
+ * On an install with no API key (the default for Max subscribers), the
+ * query fails with `Error: Not logged in · Please run /login`.
+ *
+ * Hot paths affected by this bug before 1.18.192: bg-planner, daily-planner,
+ * strategic-planner (weekly review), auto-memory extractor, task output
+ * verifier, MCP tool-inventory probe, dashboard data-enumerator, dashboard
+ * memory-consolidator, PDF OCR, periodic memory consolidation.
+ *
+ * Use `excludeDynamicSections: true` for lightweight Haiku utility calls
+ * where the Claude Code preamble (working-dir, git status, memory paths)
+ * is irrelevant noise — saves ~1-2K input tokens per call.
+ *
+ * @example Full preset (planner, agentic work)
+ *   systemPrompt: claudeCodeSystemPrompt('You are a planner. Emit JSON.')
+ *
+ * @example Minimal preset (single-shot Haiku utility)
+ *   systemPrompt: claudeCodeSystemPrompt('Be terse.', { minimal: true })
+ */
+export function claudeCodeSystemPrompt(
+  append: string,
+  opts?: { minimal?: boolean },
+): { type: 'preset'; preset: 'claude_code'; append: string; excludeDynamicSections?: boolean } {
+  return {
+    type: 'preset' as const,
+    preset: 'claude_code' as const,
+    append,
+    ...(opts?.minimal ? { excludeDynamicSections: true as const } : {}),
+  };
+}
+
 export function normalizeClaudeModelForOneMillionContext(
   model: string,
   mode: OneMillionContextMode = currentOneMillionContextMode(),
