@@ -214,7 +214,9 @@ describe('gateway context overflow retry', () => {
       'Please recreate the coaches dashboard in the project and host it on Netlify.',
     );
 
-    expect(response).toContain('moved this into background task');
+    // 1.18.190 — overflow now routes to the planner-orchestrator chain
+    // instead of a monolithic bg-task. Message describes the new flow.
+    expect(response).toContain('decomposing your request into chained steps');
     expect(response).toContain('bg-');
     expect(response).not.toContain('Please resend your message');
     expect(mocks.runAgent).toHaveBeenCalledTimes(2);
@@ -296,7 +298,9 @@ describe('gateway context overflow retry', () => {
       'Please recreate the coaches dashboard in the project and host it on Netlify.',
     );
 
-    expect(response).toContain('moved this into background task');
+    // 1.18.190 — overflow now routes through planner. Same code path
+    // as the prior test; message updated to match new flow.
+    expect(response).toContain('decomposing your request into chained steps');
     expect(response).not.toContain('Please resend your message');
     expect(mocks.runAgent).toHaveBeenCalledTimes(2);
   });

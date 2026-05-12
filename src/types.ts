@@ -351,6 +351,27 @@ export interface BackgroundTask {
   // doesn't propagate.
   verificationFlag?: 'claimed-without-evidence';
   verificationDetails?: string;
+  // 1.18.190 — planner-orchestrator chained tasks (see agent/bg-planner.ts
+  // + agent/bg-orchestrator.ts). A "chain" is the canonical replacement
+  // for monolithic bg-tasks on multi-step work:
+  //   - kind='planner': single task that LLM-plans the work and emits
+  //     a Plan (3-7 PlanSteps) persisted to disk. Cheap (Haiku, 1-3 turns).
+  //   - kind='step': one of N chained execution tasks, each with a tight
+  //     scope, fresh 200K worker context, and a clear deliverable. None
+  //     can autocompact-thrash because the scope is bounded.
+  //   - kind='monolithic' (default when unset): legacy single-worker
+  //     pattern that does everything in one SDK session. Still used for
+  //     explicit start_background_task MCP calls that opt out of chains.
+  /** Discriminator: planner / step / monolithic (default). */
+  kind?: 'planner' | 'step' | 'monolithic';
+  /** Chain identifier shared by the planner task and all its step tasks. */
+  chainId?: string;
+  /** Plan identifier (file basename in .clementine/plans/<planId>.json). */
+  planId?: string;
+  /** For kind='step': 0-indexed position within the plan's steps array. */
+  stepIndex?: number;
+  /** For kind='step': the task that queued this one (planner or prev step). */
+  parentTaskId?: string;
 }
 
 // ── Per-agent heartbeat ──────────────────────────────────────────────

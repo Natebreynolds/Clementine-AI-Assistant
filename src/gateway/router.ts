@@ -541,26 +541,42 @@ export class Gateway {
   }
 
   private queueBackgroundTaskAfterContextOverflow(sessionKey: string, prompt: string): { task: BackgroundTask; response: string } {
-    const recommendation = detectComplexTaskForBackground(prompt);
+    // 1.18.190 — the chat-overflow recovery path is now the canonical
+    // entry to the planner-orchestrator chain. Instead of queuing a
+    // monolithic bg-task that tries to do everything in one worker
+    // (which thrashed when the worker's context filled), we queue a
+    // planner task. The planner is a tiny Sonnet LLM call that
+    // decomposes the user's request into 3-7 PlanSteps; the
+    // orchestrator then dispatches one step at a time, each with
+    // its own fresh 200K worker window. See agent/bg-planner.ts +
+    // agent/bg-orchestrator.ts for the full pattern.
+    //
+    // The legacy `detectComplexTaskForBackground` heuristic is no
+    // longer used here — the planner itself decides how to decompose,
+    // and per-step maxMinutes is governed by orchestrator settings.
+    // Planner tasks get a tight 5-minute cap; total chain wall-clock
+    // is the sum of each step's own maxMinutes.
     const task = createBackgroundTask({
       fromAgent: this.backgroundAgentForSession(sessionKey),
       prompt,
-      maxMinutes: recommendation?.suggestedMaxMinutes ?? 60,
+      maxMinutes: 5, // planner needs minutes, not hours
       sessionKey,
+      kind: 'planner',
     });
     logger.warn({
       taskId: task.id,
       sessionKey,
       fromAgent: task.fromAgent,
-      maxMinutes: task.maxMinutes,
-    }, 'Queued background task after repeated chat context overflow');
+      kind: 'planner',
+    }, 'Queued planner task after repeated chat context overflow');
     return {
       task,
       response: [
-        `The live chat context hit the limit, so I moved this into background task **${task.id}** and kept your request attached.`,
+        `The live chat context hit the limit, so I'm decomposing your request into chained steps via background task **${task.id}**.`,
         '',
-        `It will run as **${task.fromAgent}** in a fresh task session with a ${task.maxMinutes} minute cap.`,
-        `Use \`status ${task.id}\` or check the dashboard Background Tasks panel for progress.`,
+        `Step 1: a Sonnet planner reads the request and emits a plan (~30 seconds).`,
+        `Then each step runs as its own fresh task — you'll see step-by-step updates rather than one big "done" at the end.`,
+        `Use \`status ${task.id}\` or the dashboard Background Tasks panel for progress.`,
       ].join('\n'),
     };
   }

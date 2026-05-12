@@ -66,9 +66,23 @@ function safeWrite(file: string, task: BackgroundTask): void {
 /**
  * Create a new pending task on disk and return it. Caller (the MCP tool)
  * doesn't await execution — the daemon picks the task up asynchronously.
+ *
+ * 1.18.190 — accepts the new chain fields (kind / chainId / planId /
+ * stepIndex / parentTaskId) for planner-orchestrator chained tasks. All
+ * are optional; callers that pass none get the legacy monolithic shape.
  */
 export function createBackgroundTask(
-  input: { fromAgent: string; prompt: string; maxMinutes: number; sessionKey?: string },
+  input: {
+    fromAgent: string;
+    prompt: string;
+    maxMinutes: number;
+    sessionKey?: string;
+    kind?: BackgroundTask['kind'];
+    chainId?: string;
+    planId?: string;
+    stepIndex?: number;
+    parentTaskId?: string;
+  },
   opts?: BackgroundTaskOptions,
 ): BackgroundTask {
   const now = new Date();
@@ -81,6 +95,11 @@ export function createBackgroundTask(
     createdAt: now.toISOString(),
   };
   if (input.sessionKey) task.sessionKey = input.sessionKey;
+  if (input.kind) task.kind = input.kind;
+  if (input.chainId) task.chainId = input.chainId;
+  if (input.planId) task.planId = input.planId;
+  if (typeof input.stepIndex === 'number') task.stepIndex = input.stepIndex;
+  if (input.parentTaskId) task.parentTaskId = input.parentTaskId;
   safeWrite(pathFor(task.id, opts), task);
   return task;
 }

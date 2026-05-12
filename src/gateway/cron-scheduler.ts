@@ -2189,7 +2189,24 @@ export class CronScheduler {
       const started = markBgTaskRunning(task.id, undefined, { jobName });
       if (!started) continue;
 
-      logger.info({ id: started.id, fromAgent: started.fromAgent, maxMinutes: started.maxMinutes }, 'Background task picked up');
+      logger.info({
+        id: started.id,
+        fromAgent: started.fromAgent,
+        maxMinutes: started.maxMinutes,
+        kind: started.kind ?? 'monolithic',
+        chainId: started.chainId,
+        planId: started.planId,
+        stepIndex: started.stepIndex,
+      }, 'Background task picked up');
+
+      // 1.18.190 — planner tasks don't run through the worker pattern.
+      // They make a single LLM call (Sonnet) that decomposes the user
+      // request into a Plan, persist it, then dispatch step 0.
+      if (started.kind === 'planner') {
+        this.runPlannerBackgroundTask(started)
+          .catch((err) => logger.warn({ err, id: started.id }, 'Planner background task failed at top level'));
+        continue;
+      }
       updateBackgroundTask(started.id, {
         lastNotifiedAt: new Date().toISOString(),
         progressMessageCount: 0,
@@ -2253,6 +2270,15 @@ export class CronScheduler {
         }
         // Dispatch the deliverable to the originating agent's channel.
         const completed = loadBackgroundTask(started.id) ?? started;
+        // 1.18.190 — chained step completion. If this task was a step in
+        // a Plan, advance the chain instead of treating completion as the
+        // end of the job. The orchestrator queues the next step and the
+        // owner sees a step-by-step update rather than one final dump.
+        if (completed.kind === 'step') {
+          this.advanceChainAfterStep(completed).catch((err) =>
+            logger.warn({ err, id: completed.id }, 'Failed to advance chain after step completion'));
+          return;
+        }
         const deliveryHead = `**Background task ${started.id} done** — ${started.prompt.slice(0, 100).replace(/\s+/g, ' ')}${started.prompt.length > 100 ? '...' : ''}\n\n`;
         const body = (result ?? '').slice(0, 1500);
         const deliveryMessage = deliveryHead + body;
@@ -2279,6 +2305,14 @@ export class CronScheduler {
           logger.warn({ err: saveErr, id: started.id }, 'Failed to mark background task failed');
         }
         const failed = loadBackgroundTask(started.id) ?? started;
+        // 1.18.190 — chained step failure pauses the chain. The owner
+        // gets a "chain paused at step N" message instead of just "task
+        // failed" so they can retry/edit/abandon.
+        if (failed.kind === 'step') {
+          this.advanceChainAfterStep(failed).catch((advanceErr) =>
+            logger.warn({ err: advanceErr, id: failed.id }, 'Failed to pause chain after step failure'));
+          return;
+        }
         const failMessage = `**Background task ${started.id} failed** — ${errStr.slice(0, 200)}`;
         this.dispatcher
           .send(failMessage, this.dispatchContextForBackgroundTask(failed))
@@ -2292,6 +2326,133 @@ export class CronScheduler {
           failed.id,
         );
       });
+    }
+  }
+
+  /**
+   * 1.18.190 — execute a planner bg-task. The task's `prompt` is the
+   * original user request that caused chat overflow. Decompose via
+   * `planRequest` (Sonnet), persist the Plan, dispatch step 0 via
+   * `dispatchChain`, then mark this planner task done with a summary.
+   *
+   * Failure mode: if planRequest throws, mark planner task failed
+   * and surface to the originating chat — no chain ever starts.
+   */
+  private async runPlannerBackgroundTask(task: BackgroundTask): Promise<void> {
+    try {
+      const { planRequest, savePlan } = await import('../agent/bg-planner.js');
+      const { dispatchChain } = await import('../agent/bg-orchestrator.js');
+
+      // Resolve the active project for this session, if any. The chat
+      // overflow path already set this when the user mentioned a
+      // project name; if none was set, the planner runs without
+      // project context and its first step is typically a
+      // project_discover.
+      const project = task.sessionKey
+        ? (this.gateway.getSessionProject?.(task.sessionKey) ?? null)
+        : null;
+
+      logger.info({
+        id: task.id,
+        sessionKey: task.sessionKey,
+        projectPath: project?.path,
+      }, 'Planner bg-task: decomposing user request');
+
+      const plan = await planRequest({
+        userRequest: task.prompt,
+        ...(task.sessionKey ? { originatingSessionKey: task.sessionKey } : {}),
+        ...(project ? { project } : {}),
+      });
+      savePlan(plan, plan.projectPath);
+
+      // Mark the planner task done with a concise summary so the
+      // dashboard + recall show what happened.
+      const planSummary = [
+        `Planned ${plan.steps.length} steps for: ${task.prompt.slice(0, 80)}${task.prompt.length > 80 ? '...' : ''}`,
+        '',
+        ...plan.steps.map((s, i) => `${i + 1}. ${s.title}`),
+        '',
+        `Chain id: ${plan.chainId}`,
+        `Plan id: ${plan.id}`,
+      ].join('\n');
+      try { markBgTaskDone(task.id, planSummary); }
+      catch (err) { logger.warn({ err, id: task.id }, 'Failed to mark planner task done'); }
+
+      // Send a kickoff message to the originating chat — "I planned X
+      // steps, starting step 1 now" — so the owner sees the
+      // decomposition before watching steps land one at a time.
+      const completed = loadBackgroundTask(task.id) ?? task;
+      const kickoffHeader = `**Plan ready (${plan.steps.length} steps)** — starting step 1: ${plan.steps[0]?.title ?? '(unknown)'}\n\n`;
+      const kickoffBody = plan.steps.map((s, i) => `${i + 1}. ${s.title}`).join('\n');
+      this.dispatcher
+        .send(kickoffHeader + kickoffBody, this.dispatchContextForBackgroundTask(completed))
+        .catch((err) => logger.debug({ err, id: task.id }, 'Failed to dispatch plan kickoff'));
+      this.mirrorBackgroundTaskToChat(
+        completed.sessionKey,
+        `[Plan ${plan.id} created with ${plan.steps.length} steps for: ${task.prompt.slice(0, 200)}]`,
+        kickoffHeader + kickoffBody,
+        completed.id,
+      );
+
+      // Dispatch the first step. The orchestrator persists task ids
+      // back into the plan so subsequent advancement is idempotent.
+      dispatchChain(plan);
+    } catch (err) {
+      const errStr = String(err).slice(0, 500);
+      logger.warn({ err, id: task.id }, 'Planner bg-task failed');
+      try { markBgTaskFailed(task.id, errStr, 'failed'); }
+      catch (saveErr) { logger.warn({ err: saveErr, id: task.id }, 'Failed to mark planner task failed'); }
+      const failed = loadBackgroundTask(task.id) ?? task;
+      const failMessage = `**Planning failed** — ${errStr.slice(0, 300)}\n\nThe request didn't decompose into chained steps. Try rephrasing or breaking it up manually.`;
+      this.dispatcher
+        .send(failMessage, this.dispatchContextForBackgroundTask(failed))
+        .catch(() => { /* non-fatal */ });
+    }
+  }
+
+  /**
+   * 1.18.190 — after a chained step completes (success or failure),
+   * advance the chain. Success queues the next step; failure pauses
+   * the chain and notifies the owner. The owner gets a per-step
+   * update message so they see progress instead of one final dump.
+   */
+  private async advanceChainAfterStep(completed: BackgroundTask): Promise<void> {
+    try {
+      const { advanceChain, formatChainStatusUpdate } = await import('../agent/bg-orchestrator.js');
+      const { loadPlan } = await import('../agent/bg-planner.js');
+
+      const next = advanceChain({ completedTask: completed });
+      const plan = completed.planId ? loadPlan(completed.planId) : null;
+
+      // Send a step-level update to the originating chat.
+      if (plan && typeof completed.stepIndex === 'number') {
+        const step = plan.steps[completed.stepIndex];
+        if (step) {
+          const statusMessage = formatChainStatusUpdate(plan, step);
+          this.dispatcher
+            .send(statusMessage, this.dispatchContextForBackgroundTask(completed))
+            .catch((err) => logger.debug({ err, id: completed.id }, 'Failed to dispatch chain step update'));
+          this.mirrorBackgroundTaskToChat(
+            completed.sessionKey,
+            `[Chain ${plan.chainId} step ${completed.stepIndex + 1}/${plan.steps.length}: ${step.status}]`,
+            statusMessage,
+            completed.id,
+          );
+        }
+      }
+
+      // If no next step was queued (chain complete or paused), nothing
+      // more to do here — the formatChainStatusUpdate already covered
+      // the user-facing summary.
+      if (!next) {
+        logger.info({
+          completedTaskId: completed.id,
+          planId: completed.planId,
+          stepIndex: completed.stepIndex,
+        }, 'Chain advancement: no next step (complete or paused)');
+      }
+    } catch (err) {
+      logger.warn({ err, id: completed.id }, 'advanceChainAfterStep: failed');
     }
   }
 
