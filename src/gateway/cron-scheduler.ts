@@ -1057,6 +1057,33 @@ export class CronScheduler {
     return ctx;
   }
 
+  /**
+   * Mirror a background-task message (start / done / failed) into the
+   * originating chat session's memory. Without this, bg: tasks finish,
+   * deliver their result to Discord/Slack, and then the very next chat
+   * turn comes back to an assistant that has zero memory of any of it —
+   * the user asks "fix the site you just deployed" and gets "I don't see
+   * any record of a Netlify site." injectContext writes into both the
+   * pending-context map (visible to the next SDK turn) and the memory
+   * store (searchable later by the assistant).
+   */
+  private mirrorBackgroundTaskToChat(
+    sessionKey: string | undefined,
+    userTextPlaceholder: string,
+    assistantText: string,
+  ): void {
+    if (!sessionKey) return;
+    try {
+      this.gateway.injectContext(sessionKey, userTextPlaceholder, assistantText, {
+        pending: false,
+        model: 'bg-task',
+        countExchange: true,
+      });
+    } catch (err) {
+      logger.debug({ err, sessionKey }, 'Failed to mirror background task message into chat memory');
+    }
+  }
+
   /** Same idea for workflows. Workflows can be agent-scoped via WorkflowDefinition.agentSlug. */
   private dispatchContextForWorkflow(name: string): NotificationContext {
     const wf = this.workflowDefs.find(w => w.name === name);
@@ -2122,12 +2149,19 @@ export class CronScheduler {
         lastNotifiedAt: new Date().toISOString(),
         progressMessageCount: 0,
       });
+      const startMessage = `**Background task ${started.id} started** — ${started.prompt.slice(0, 120).replace(/\s+/g, ' ')}${started.prompt.length > 120 ? '...' : ''}\n\nI'll update you every 15 minutes or when it finishes.`;
       this.dispatcher
-        .send(
-          `**Background task ${started.id} started** — ${started.prompt.slice(0, 120).replace(/\s+/g, ' ')}${started.prompt.length > 120 ? '...' : ''}\n\nI'll update you every 15 minutes or when it finishes.`,
-          this.dispatchContextForBackgroundTask(started),
-        )
+        .send(startMessage, this.dispatchContextForBackgroundTask(started))
         .catch((err) => logger.debug({ err, id: started.id }, 'Failed to dispatch background task start'));
+      // Mirror the start announcement into the originating chat session's
+      // memory so the assistant remembers it has a task running. Without
+      // this, the next chat turn the user sends comes back to a session
+      // that has no idea any bg: work was ever queued.
+      this.mirrorBackgroundTaskToChat(
+        started.sessionKey,
+        `[Background task ${started.id} queued: ${started.prompt.slice(0, 200)}]`,
+        startMessage,
+      );
 
       // Don't await — fire-and-forget. The 3s tick continues to scan.
       const maxHours = Math.max(0.05, started.maxMinutes / 60);
@@ -2173,9 +2207,18 @@ export class CronScheduler {
         const completed = loadBackgroundTask(started.id) ?? started;
         const deliveryHead = `**Background task ${started.id} done** — ${started.prompt.slice(0, 100).replace(/\s+/g, ' ')}${started.prompt.length > 100 ? '...' : ''}\n\n`;
         const body = (result ?? '').slice(0, 1500);
+        const deliveryMessage = deliveryHead + body;
         this.dispatcher
-          .send(deliveryHead + body, this.dispatchContextForBackgroundTask(completed))
+          .send(deliveryMessage, this.dispatchContextForBackgroundTask(completed))
           .catch((err) => logger.debug({ err, id: started.id }, 'Failed to dispatch background task result'));
+        // Mirror into chat memory so a follow-up like "fix the site"
+        // doesn't get a blank stare — the assistant needs to remember
+        // it just deployed something and where it lives.
+        this.mirrorBackgroundTaskToChat(
+          completed.sessionKey,
+          `[Background task ${completed.id} delivered: ${started.prompt.slice(0, 200)}]`,
+          deliveryMessage,
+        );
       }).catch((err) => {
         clearInterval(progressTimer);
         const errStr = String(err).slice(0, 500);
@@ -2185,12 +2228,17 @@ export class CronScheduler {
           logger.warn({ err: saveErr, id: started.id }, 'Failed to mark background task failed');
         }
         const failed = loadBackgroundTask(started.id) ?? started;
+        const failMessage = `**Background task ${started.id} failed** — ${errStr.slice(0, 200)}`;
         this.dispatcher
-          .send(
-            `**Background task ${started.id} failed** — ${errStr.slice(0, 200)}`,
-            this.dispatchContextForBackgroundTask(failed),
-          )
+          .send(failMessage, this.dispatchContextForBackgroundTask(failed))
           .catch(() => { /* non-fatal */ });
+        // Mirror failures too — the next chat turn should know the task
+        // died rather than silently pretending it never happened.
+        this.mirrorBackgroundTaskToChat(
+          failed.sessionKey,
+          `[Background task ${failed.id} failed: ${started.prompt.slice(0, 200)}]`,
+          failMessage,
+        );
       });
     }
   }
