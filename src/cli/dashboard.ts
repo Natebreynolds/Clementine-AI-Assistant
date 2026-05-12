@@ -39,6 +39,7 @@ import {
   SESSIONS_FILE,
   TIMEZONE,
   applyOneMillionContextRecovery,
+  claudeCodeSubprocessEnv,
   claudeCodeSystemPrompt,
   currentTimeZone,
   looksLikeClaudeOneMillionContextError,
@@ -6127,6 +6128,8 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
             'You are a data enumerator. You call the given tool once, extract the items from its response, and emit a strict JSON array. No commentary.',
             { minimal: true },
           ),
+          // 1.18.194 — propagate OAuth token to SDK subprocess.
+          env: claudeCodeSubprocessEnv(),
           allowedTools: [tool],
           mcpServers,
           permissionMode: 'dontAsk' as const,
@@ -9438,6 +9441,8 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
                 'You are a memory consolidation assistant. Extract only facts directly evidenced by the corpus. Be terse. Output exactly the requested format.',
                 { minimal: true },
               ),
+              // 1.18.194 — propagate OAuth token to SDK subprocess.
+              env: claudeCodeSubprocessEnv(),
             }),
           });
           for await (const msg of stream) {

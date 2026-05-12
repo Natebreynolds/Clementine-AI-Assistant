@@ -14,6 +14,7 @@ import pino from 'pino';
 import {
   BASE_DIR,
   applyOneMillionContextRecovery,
+  claudeCodeSubprocessEnv,
   claudeCodeSystemPrompt,
   looksLikeClaudeOneMillionContextError,
   normalizeClaudeSdkOptionsForOneMillionContext,
@@ -523,6 +524,8 @@ export async function probeAvailableTools(force = false): Promise<ToolInventory>
       options: normalizeClaudeSdkOptionsForOneMillionContext({
         // 1.18.192 — preset form for Claude Code subscription auth.
         systemPrompt: claudeCodeSystemPrompt('Reply ok.', { minimal: true }),
+        // 1.18.194 — propagate OAuth token to SDK subprocess.
+        env: claudeCodeSubprocessEnv(),
         model: 'claude-haiku-4-5',
         permissionMode: 'dontAsk' as const,
         mcpServers: externalMcpServers,

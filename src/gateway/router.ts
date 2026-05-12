@@ -73,15 +73,13 @@ const CHAT_TIMEOUT_MS = 10 * 60 * 1000;
  *  Safety net so no session runs forever, even if active.
  *  Primary guardrail is cost budget (maxBudgetUsd), not this timer. */
 const CHAT_MAX_WALL_MS = 30 * 60 * 1000;
-// 1.18.189 — tightened from 6_000 / 16_000 because the recovery prompt
-// was eating ~22KB of the bg-task worker's context window before any
-// real work started. On 2026-05-12 the worker autocompact-thrashed while
-// reading project files; the new tighter caps give it ~10KB more headroom
-// to do actual tool calls. The dropped content (older memory recall,
-// less-relevant bg-task headlines) is recoverable via memory_search if
-// the model actually needs it.
+// 1.18.189 — tightened cap on retry-recovery context. 1.18.194 — only
+// CHAT_CONTEXT_RETRY_CONTEXT_MAX_CHARS still has a caller (the legacy
+// buildContextOverflowRetryPrompt, exported for an existing unit test
+// but no longer invoked from the chat path). The system-prompt-cap was
+// removed when we deleted the in-line retry loop in favor of trusting
+// the SDK's own autocompact.
 const CHAT_CONTEXT_RETRY_CONTEXT_MAX_CHARS = 3_000;
-const CHAT_CONTEXT_RETRY_SYSTEM_MAX_CHARS = 8_000;
 const BACKGROUND_TASK_ID_RE = /\bbg-[a-z0-9]+-[a-f0-9]{6}\b/i;
 
 type TranscriptSearchRow = {
@@ -556,46 +554,12 @@ export class Gateway {
     ].join('\n');
   }
 
-  private queueBackgroundTaskAfterContextOverflow(sessionKey: string, prompt: string): { task: BackgroundTask; response: string } {
-    // 1.18.190 — the chat-overflow recovery path is now the canonical
-    // entry to the planner-orchestrator chain. Instead of queuing a
-    // monolithic bg-task that tries to do everything in one worker
-    // (which thrashed when the worker's context filled), we queue a
-    // planner task. The planner is a tiny Sonnet LLM call that
-    // decomposes the user's request into 3-7 PlanSteps; the
-    // orchestrator then dispatches one step at a time, each with
-    // its own fresh 200K worker window. See agent/bg-planner.ts +
-    // agent/bg-orchestrator.ts for the full pattern.
-    //
-    // The legacy `detectComplexTaskForBackground` heuristic is no
-    // longer used here — the planner itself decides how to decompose,
-    // and per-step maxMinutes is governed by orchestrator settings.
-    // Planner tasks get a tight 5-minute cap; total chain wall-clock
-    // is the sum of each step's own maxMinutes.
-    const task = createBackgroundTask({
-      fromAgent: this.backgroundAgentForSession(sessionKey),
-      prompt,
-      maxMinutes: 5, // planner needs minutes, not hours
-      sessionKey,
-      kind: 'planner',
-    });
-    logger.warn({
-      taskId: task.id,
-      sessionKey,
-      fromAgent: task.fromAgent,
-      kind: 'planner',
-    }, 'Queued planner task after repeated chat context overflow');
-    return {
-      task,
-      response: [
-        `The live chat context hit the limit, so I'm decomposing your request into chained steps via background task **${task.id}**.`,
-        '',
-        `Step 1: a Sonnet planner reads the request and emits a plan (~30 seconds).`,
-        `Then each step runs as its own fresh task — you'll see step-by-step updates rather than one big "done" at the end.`,
-        `Use \`status ${task.id}\` or the dashboard Background Tasks panel for progress.`,
-      ].join('\n'),
-    };
-  }
+  // 1.18.194 — `queueBackgroundTaskAfterContextOverflow` removed.
+  // The chat-overflow path no longer auto-fires the planner. Instead
+  // the chat-error handler surfaces a clean "rephrase or `/plan`"
+  // message and trusts the SDK's own autocompact. The planner +
+  // orchestrator stay available as the implementation behind explicit
+  // `/plan` (see `_maybeHandlePlanMode`).
 
   /**
    * 1.18.191 — chat-side plan mode state machine.
@@ -2671,8 +2635,6 @@ export class Gateway {
           delete sessState.pendingInterrupt;
         }
 
-        let contextOverflowRecoveryPrompt = '';
-
         try {
           // ── Canonical SDK chat path (Phase 5) ────────────────────────
           // runAgent() owns chat. No legacy fallback — errors propagate
@@ -2815,8 +2777,6 @@ export class Gateway {
           const chatSystemAppend = resolvedSkills && resolvedSkills.promptBlock
             ? (baseSystemAppend ? `${baseSystemAppend}\n\n${resolvedSkills.promptBlock}` : resolvedSkills.promptBlock)
             : baseSystemAppend;
-          const retrySystemAppend = trimContextRecoveryText(chatSystemAppend, CHAT_CONTEXT_RETRY_SYSTEM_MAX_CHARS);
-
           // Per-turn context (recall + persistent learnings + silent
           // blocks + security/toolset directives) — real chat only.
           // Builder doesn't need recall of unrelated transcripts.
@@ -2966,34 +2926,12 @@ export class Gateway {
             abortSignal: chatAc.signal,
           });
 
-          let didContextOverflowRetry = false;
-          const contextOverflowAfterRetryError = () => new Error('rapid_refill_breaker after context overflow retry');
-          const retryAfterContextOverflow = async () => {
-            if (didContextOverflowRetry) throw contextOverflowAfterRetryError();
-            didContextOverflowRetry = true;
-            const retryPrompt = buildContextOverflowRetryPrompt({
-              chatPrompt,
-              turnContextPrefix,
-              project: sess?.project ?? null,
-            });
-            contextOverflowRecoveryPrompt = retryPrompt;
-            logger.info({
-              sessionKey: effectiveSessionKey,
-              hadResume: !!priorSdkSessionId,
-              promptChars: finalPrompt.length,
-              retryPromptChars: retryPrompt.length,
-              systemAppendChars: chatSystemAppend.length,
-              retrySystemAppendChars: retrySystemAppend.length,
-            }, 'Context overflow — retrying current message in fresh SDK session');
-            if (onProgress) {
-              await onProgress('refreshing conversation context...').catch(() => { /* non-fatal */ });
-            }
-            this.assistant.clearSession(effectiveSessionKey);
-            return runAgent(retryPrompt, buildRunAgentChatOptions({
-              ...(retrySystemAppend ? { systemPromptAppend: retrySystemAppend } : {}),
-            }));
-          };
-
+          // 1.18.194 — single SDK call. The SDK does its own autocompact
+          // internally; we don't layer our own compress-and-retry on top.
+          // If the SDK returns context_overflow (either thrown or as a
+          // result with terminalReason), we surface a clean "rephrase or
+          // /plan" message via the `case 'context_overflow':` handler
+          // below. No more "Planning failed" half-finished chains.
           let runAgentResult;
           try {
             runAgentResult = await runAgent(finalPrompt, buildRunAgentChatOptions({
@@ -3004,35 +2942,19 @@ export class Gateway {
             if (chatAc.signal.aborted || classifyChatError(err) !== 'context_overflow') {
               throw err;
             }
-            runAgentResult = await retryAfterContextOverflow();
+            // Re-throw so the outer catch's classifyChatError gets it
+            // and routes to the 'context_overflow' case.
+            throw err;
           }
 
           if (!chatAc.signal.aborted && runAgentResultIndicatesContextOverflow(runAgentResult)) {
-            if (didContextOverflowRetry) {
-              logger.info({
-                sessionKey: effectiveSessionKey,
-                subtype: runAgentResult.subtype,
-                terminalReason: runAgentResult.terminalReason,
-                textPreview: runAgentResult.text?.slice(0, 240),
-              }, 'Context overflow result after retry — queueing background task');
-              throw contextOverflowAfterRetryError();
-            }
             logger.info({
               sessionKey: effectiveSessionKey,
               subtype: runAgentResult.subtype,
               terminalReason: runAgentResult.terminalReason,
               textPreview: runAgentResult.text?.slice(0, 240),
-            }, 'Context overflow result — retrying current message in fresh SDK session');
-            runAgentResult = await retryAfterContextOverflow();
-            if (runAgentResultIndicatesContextOverflow(runAgentResult)) {
-              logger.info({
-                sessionKey: effectiveSessionKey,
-                subtype: runAgentResult.subtype,
-                terminalReason: runAgentResult.terminalReason,
-                textPreview: runAgentResult.text?.slice(0, 240),
-              }, 'Context overflow result after retry — queueing background task');
-              throw contextOverflowAfterRetryError();
-            }
+            }, 'Context overflow result — autocompact ceiling reached, surfacing recovery message');
+            throw new Error('context_overflow_after_autocompact');
           }
 
           if (ledgerRunMetadata) {
@@ -3120,19 +3042,31 @@ export class Gateway {
               applyOneMillionContextRecovery();
               this.clearSession(effectiveSessionKey);
               return oneMillionContextRecoveryMessage();
-            case 'context_overflow':
-              logger.info({ sessionKey }, 'Context overflow after retry — queueing background task');
+            case 'context_overflow': {
+              // 1.18.194 — trust the SDK. By the time we see context_overflow
+              // here, the SDK has ALREADY tried autocompact (it's built-in).
+              // Our previous behavior was to compress + retry + queue a
+              // separate planner background task. That layered our own
+              // retry on top of the SDK's, and when any step in the planner
+              // pipeline failed (auth, planning, chain dispatch), users saw
+              // a confusing "Planning failed" message — that's what bit
+              // Zach. SDK best practice: when autocompact + retry have both
+              // failed, that's a real context ceiling. Surface a clean
+              // message that gives the owner two recovery options, clear
+              // the session pointer, and trust them to resend smaller or
+              // opt in to explicit plan mode.
+              logger.info({ sessionKey }, 'Context overflow — autocompact ceiling reached, resetting');
               this.assistant.clearSession(effectiveSessionKey);
-              {
-                const promptForBackground = contextOverflowRecoveryPrompt || chatPrompt;
-                const { response, task } = this.queueBackgroundTaskAfterContextOverflow(sessionKey, promptForBackground);
-                if (ledgerRunMetadata) {
-                  ledgerRunMetadata.executionMode = 'background_queued';
-                  ledgerRunMetadata.backgroundTaskId = task.id;
-                }
-                this.mirrorChatExchange(sessionKey, originalText, response, { model: 'chat-control' });
-                return response;
-              }
+              const response = [
+                "That work pushed past the context limit even with autocompact.",
+                "I've reset our conversation. Two ways forward:",
+                "",
+                "1. Rephrase the task in smaller scope (e.g. 'just the first 10' instead of 'all 100')",
+                "2. Use `/plan` to have me decompose it into chained workers before running",
+              ].join('\n');
+              this.mirrorChatExchange(sessionKey, originalText, response, { model: 'chat-control' });
+              return response;
+            }
             case 'auth':
               this.recordAuthFailure();
               return "I'm temporarily offline due to an authentication issue. The owner needs to re-authenticate — I'll recover automatically once it's resolved.";

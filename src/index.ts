@@ -712,6 +712,8 @@ async function asyncMain(): Promise<void> {
                 'You are a memory consolidation assistant. Be concise.',
                 { minimal: true },
               ),
+              // 1.18.194 — propagate OAuth token to SDK subprocess.
+              env: config.claudeCodeSubprocessEnv(),
             }),
           });
           for await (const msg of stream) {

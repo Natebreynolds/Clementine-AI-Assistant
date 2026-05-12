@@ -22,7 +22,7 @@
 import { execSync } from 'node:child_process';
 import path from 'node:path';
 import { describe, it, expect } from 'vitest';
-import { claudeCodeSystemPrompt } from '../src/config.js';
+import { claudeCodeSubprocessEnv, claudeCodeSystemPrompt } from '../src/config.js';
 
 describe('claudeCodeSystemPrompt helper', () => {
   it('returns the preset shape for SDK auth', () => {
@@ -37,6 +37,25 @@ describe('claudeCodeSystemPrompt helper', () => {
   it('supports minimal mode for lightweight Haiku utility calls', () => {
     const result = claudeCodeSystemPrompt('be terse', { minimal: true });
     expect(result.excludeDynamicSections).toBe(true);
+  });
+});
+
+describe('claudeCodeSubprocessEnv helper (1.18.194)', () => {
+  it('returns the basics every SDK subprocess needs', () => {
+    const env = claudeCodeSubprocessEnv();
+    expect(env.PATH).toBeDefined();
+    expect(env.HOME).toBeDefined();
+    expect(env.CLEMENTINE_HOME).toBeDefined();
+  });
+
+  it('propagates OAuth token when one is configured', () => {
+    // We can't assert the actual value without exposing it, but we can
+    // check the shape: if process.env has CLAUDE_CODE_OAUTH_TOKEN, the
+    // helper should surface it. In CI without one, this is a no-op.
+    if (process.env.CLAUDE_CODE_OAUTH_TOKEN) {
+      const env = claudeCodeSubprocessEnv();
+      expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe(process.env.CLAUDE_CODE_OAUTH_TOKEN);
+    }
   });
 });
 

@@ -16,6 +16,7 @@ import {
   INBOX_DIR,
   MODELS,
   applyOneMillionContextRecovery,
+  claudeCodeSubprocessEnv,
   claudeCodeSystemPrompt,
   looksLikeClaudeOneMillionContextError,
   normalizeClaudeSdkOptionsForOneMillionContext,
@@ -277,6 +278,8 @@ Rules:
             'You are a planning assistant. Analyze the context and produce a prioritized daily plan as JSON. Return only valid JSON, no markdown fencing.',
             { minimal: true },
           ),
+          // 1.18.194 — propagate OAuth token to SDK subprocess.
+          env: claudeCodeSubprocessEnv(),
         }),
       });
       for await (const msg of stream) {

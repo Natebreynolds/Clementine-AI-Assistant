@@ -126,11 +126,13 @@ describe('gateway context overflow retry', () => {
     mocks.detectComplexTaskForBackground.mockReturnValue(null);
   });
 
-  it('retries the current chat message once in a fresh SDK session after context overflow', async () => {
+  it('surfaces clean recovery message on first overflow (1.18.194 — no retry layer)', async () => {
+    // 1.18.194 — we no longer layer our own retry-with-compressed-prompt
+    // on top of the SDK's autocompact. When the SDK throws context_overflow,
+    // we trust that autocompact has already tried. Surface a clean message
+    // and clear the session — owner can resend smaller or use `/plan`.
     const assistant = fakeAssistant();
-    mocks.runAgent
-      .mockRejectedValueOnce(new Error('Prompt is too long'))
-      .mockResolvedValueOnce(fakeRunResult());
+    mocks.runAgent.mockRejectedValueOnce(new Error('Prompt is too long'));
 
     const gateway = new Gateway(assistant as never) as Gateway & {
       getAgentManager: () => unknown;
@@ -150,57 +152,15 @@ describe('gateway context overflow retry', () => {
       progress,
     );
 
-    expect(response).toBe('published dashboard');
-    expect(mocks.runAgent).toHaveBeenCalledTimes(2);
-
-    const firstCall = mocks.runAgent.mock.calls[0]!;
-    const secondCall = mocks.runAgent.mock.calls[1]!;
-    expect(firstCall[1].resumeSessionId).toBe('sdk-old');
-    expect(secondCall[1].resumeSessionId).toBeUndefined();
-    expect(secondCall[0]).toContain('fresh session');
-    expect(secondCall[0]).toContain('Do not ask the user to resend it');
-    expect(secondCall[0]).toContain('Please recreate the coaches dashboard');
+    expect(response).toContain('past the context limit');
+    expect(response).toContain('/plan');
+    expect(mocks.runAgent).toHaveBeenCalledTimes(1);
     expect(assistant.clearSession).toHaveBeenCalledWith('discord:user:123');
-    expect(assistant.setSdkSessionId).toHaveBeenCalledWith('discord:user:123', 'sdk-new');
-    expect(progress).toHaveBeenCalledWith('refreshing conversation context...');
   });
 
-  it('retries when the SDK returns a rapid-refill result instead of throwing', async () => {
+  it('surfaces recovery message when SDK returns rapid-refill result (no retry)', async () => {
     const assistant = fakeAssistant();
-    mocks.runAgent
-      .mockResolvedValueOnce(fakeContextOverflowResult())
-      .mockResolvedValueOnce(fakeRunResult('done after retry'));
-
-    const gateway = new Gateway(assistant as never) as Gateway & {
-      getAgentManager: () => unknown;
-      _maybeRouteToSpecialist: () => Promise<null>;
-    };
-    gateway.getAgentManager = vi.fn(() => null);
-    gateway._maybeRouteToSpecialist = vi.fn(async () => null);
-
-    const progress = vi.fn(async () => undefined);
-    const response = await gateway.handleMessage(
-      'discord:user:123',
-      'Please recreate the coaches dashboard in the project and host it on Netlify.',
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      progress,
-    );
-
-    expect(response).toBe('done after retry');
-    expect(mocks.runAgent).toHaveBeenCalledTimes(2);
-    expect(mocks.runAgent.mock.calls[1]![1].resumeSessionId).toBeUndefined();
-    expect(assistant.clearSession).toHaveBeenCalledWith('discord:user:123');
-    expect(progress).toHaveBeenCalledWith('refreshing conversation context...');
-  });
-
-  it('queues background work instead of asking the user to resend when the retry also overflows', async () => {
-    const assistant = fakeAssistant();
-    mocks.runAgent
-      .mockRejectedValueOnce(new Error('Prompt is too long'))
-      .mockRejectedValueOnce(new Error('Autocompact is thrashing: the context refilled to the limit within 3 turns.'));
+    mocks.runAgent.mockResolvedValueOnce(fakeContextOverflowResult());
 
     const gateway = new Gateway(assistant as never) as Gateway & {
       getAgentManager: () => unknown;
@@ -214,12 +174,36 @@ describe('gateway context overflow retry', () => {
       'Please recreate the coaches dashboard in the project and host it on Netlify.',
     );
 
-    // 1.18.190 — overflow now routes to the planner-orchestrator chain
-    // instead of a monolithic bg-task. Message describes the new flow.
-    expect(response).toContain('decomposing your request into chained steps');
-    expect(response).toContain('bg-');
+    expect(response).toContain('past the context limit');
+    expect(response).toContain('/plan');
+    expect(mocks.runAgent).toHaveBeenCalledTimes(1);
+    expect(assistant.clearSession).toHaveBeenCalledWith('discord:user:123');
+  });
+
+  it('does not retry when SDK reports a thrash error (autocompact ceiling)', async () => {
+    const assistant = fakeAssistant();
+    mocks.runAgent.mockRejectedValueOnce(new Error('Autocompact is thrashing: the context refilled to the limit within 3 turns.'));
+
+    const gateway = new Gateway(assistant as never) as Gateway & {
+      getAgentManager: () => unknown;
+      _maybeRouteToSpecialist: () => Promise<null>;
+    };
+    gateway.getAgentManager = vi.fn(() => null);
+    gateway._maybeRouteToSpecialist = vi.fn(async () => null);
+
+    const response = await gateway.handleMessage(
+      'discord:user:123',
+      'Please recreate the coaches dashboard in the project and host it on Netlify.',
+    );
+
+    // 1.18.194 — overflow no longer queues a planner task. SDK's own
+    // autocompact has already tried; we surface a clean rephrase/plan
+    // message and clear the session. No more "Planning failed" stack.
+    expect(response).toContain('past the context limit');
+    expect(response).toContain('/plan');
+    expect(response).not.toContain('decomposing your request');
     expect(response).not.toContain('Please resend your message');
-    expect(mocks.runAgent).toHaveBeenCalledTimes(2);
+    expect(mocks.runAgent).toHaveBeenCalledTimes(1);
     expect(assistant.clearSession).toHaveBeenCalledWith('discord:user:123');
   });
 
@@ -280,11 +264,9 @@ describe('gateway context overflow retry', () => {
     expect(mocks.runAgent).toHaveBeenCalledTimes(1);
   });
 
-  it('queues background work when the fresh retry returns rapid-refill again', async () => {
+  it('surfaces clean recovery message when runAgent result indicates overflow', async () => {
     const assistant = fakeAssistant();
-    mocks.runAgent
-      .mockRejectedValueOnce(new Error('Prompt is too long'))
-      .mockResolvedValueOnce(fakeContextOverflowResult());
+    mocks.runAgent.mockResolvedValueOnce(fakeContextOverflowResult());
 
     const gateway = new Gateway(assistant as never) as Gateway & {
       getAgentManager: () => unknown;
@@ -298,11 +280,11 @@ describe('gateway context overflow retry', () => {
       'Please recreate the coaches dashboard in the project and host it on Netlify.',
     );
 
-    // 1.18.190 — overflow now routes through planner. Same code path
-    // as the prior test; message updated to match new flow.
-    expect(response).toContain('decomposing your request into chained steps');
-    expect(response).not.toContain('Please resend your message');
-    expect(mocks.runAgent).toHaveBeenCalledTimes(2);
+    // 1.18.194 — no more planner queue on result-shaped overflow either.
+    expect(response).toContain('past the context limit');
+    expect(response).toContain('/plan');
+    expect(response).not.toContain('decomposing your request');
+    expect(mocks.runAgent).toHaveBeenCalledTimes(1);
   });
 
   it('does not expose the old resend fallback for context overflow classification', async () => {
@@ -318,8 +300,11 @@ describe('gateway context overflow retry', () => {
 
     const response = await gateway.handleMessage('discord:user:123', 'Do a large local project build and deploy.');
 
+    // 1.18.194 — context_overflow no longer falls back to "resend" OR
+    // to a background task. New message offers two clean recovery paths.
     expect(response).not.toMatch(/resend/i);
-    expect(response).toContain('background task');
+    expect(response).toContain('past the context limit');
+    expect(response).toContain('/plan');
   });
 
   it('classifies rapid-refill run results as context overflow', () => {

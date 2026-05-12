@@ -271,6 +271,49 @@ export function claudeCodeSystemPrompt(
   };
 }
 
+/**
+ * 1.18.194 — Build the env Record for a direct SDK `query()` call so the
+ * Claude Code OAuth token reaches the SDK subprocess.
+ *
+ * Why this matters: `getSecret('CLAUDE_CODE_OAUTH_TOKEN')` reads
+ * ~/.clementine/.env and stores the value in the in-memory constant
+ * `CLAUDE_CODE_OAUTH_TOKEN` — it intentionally does NOT write to
+ * process.env (config.ts:478 keeps secrets out of process.env to prevent
+ * leakage). When a direct `query()` call omits `env:`, the SDK defaults
+ * to `process.env` — which doesn't have the token — and authentication
+ * silently falls back to API-key mode and fails with "Not logged in".
+ *
+ * 1.18.192 fixed the systemPrompt shape (preset vs raw string) but missed
+ * this env-propagation half of the same auth bug. Daily-planner, weekly
+ * review, bg-planner, and several other Haiku utility paths were still
+ * silently failing AFTER 1.18.192 because env: wasn't being passed.
+ *
+ * Use this alongside `claudeCodeSystemPrompt()` for every direct `query()`
+ * call. The runAgent path already builds its own env via buildRunAgentEnv;
+ * the assistant.ts auto-memory + verifier already use SAFE_ENV (same
+ * pattern). This helper exists for the lightweight utility callers.
+ *
+ * Priority order matches buildRunAgentEnv: OAuth > ANTHROPIC_AUTH_TOKEN > API key.
+ */
+export function claudeCodeSubprocessEnv(): Record<string, string> {
+  const env: Record<string, string> = {
+    PATH: process.env.PATH ?? '',
+    HOME: process.env.HOME ?? '',
+    LANG: process.env.LANG ?? 'en_US.UTF-8',
+    TERM: process.env.TERM ?? 'xterm-256color',
+    USER: process.env.USER ?? '',
+    SHELL: process.env.SHELL ?? '',
+    CLEMENTINE_HOME: BASE_DIR,
+  };
+  const oauthTok = CLAUDE_CODE_OAUTH_TOKEN || process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  const authTok = process.env.ANTHROPIC_AUTH_TOKEN;
+  const apiKey = ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY;
+  if (oauthTok) env.CLAUDE_CODE_OAUTH_TOKEN = oauthTok;
+  else if (authTok) env.ANTHROPIC_AUTH_TOKEN = authTok;
+  else if (apiKey) env.ANTHROPIC_API_KEY = apiKey;
+  return env;
+}
+
 export function normalizeClaudeModelForOneMillionContext(
   model: string,
   mode: OneMillionContextMode = currentOneMillionContextMode(),

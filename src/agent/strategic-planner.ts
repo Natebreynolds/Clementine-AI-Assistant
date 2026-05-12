@@ -18,6 +18,7 @@ import {
   GOALS_DIR,
   MODELS,
   applyOneMillionContextRecovery,
+  claudeCodeSubprocessEnv,
   claudeCodeSystemPrompt,
   looksLikeClaudeOneMillionContextError,
   normalizeClaudeSdkOptionsForOneMillionContext,
@@ -65,6 +66,8 @@ async function llmJsonCall(prompt: string, systemPrompt: string): Promise<string
       // failures on Max-only installs. Logs confirmed weekly review was
       // silently falling through to the fallback path here since the bug landed.
       systemPrompt: claudeCodeSystemPrompt(systemPrompt, { minimal: true }),
+      // 1.18.194 — propagate OAuth token to SDK subprocess.
+      env: claudeCodeSubprocessEnv(),
     }),
   });
   for await (const msg of stream) {

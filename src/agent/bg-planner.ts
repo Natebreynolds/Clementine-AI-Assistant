@@ -45,7 +45,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import pino from 'pino';
-import { BASE_DIR, MODELS, applyOneMillionContextRecovery, claudeCodeSystemPrompt, looksLikeClaudeOneMillionContextError, normalizeClaudeSdkOptionsForOneMillionContext } from '../config.js';
+import { BASE_DIR, MODELS, applyOneMillionContextRecovery, claudeCodeSubprocessEnv, claudeCodeSystemPrompt, looksLikeClaudeOneMillionContextError, normalizeClaudeSdkOptionsForOneMillionContext } from '../config.js';
 import type { ProjectMeta } from './assistant.js';
 
 const logger = pino({ name: 'clementine.bg-planner' });
@@ -364,6 +364,10 @@ async function runPlannerLlm(userPrompt: string, systemPrompt: string, model: st
       // from knowing the working directory + git status so it can decompose
       // accurately. See claudeCodeSystemPrompt() in config.ts.
       systemPrompt: claudeCodeSystemPrompt(systemPrompt),
+      // 1.18.194 — pass OAuth token to the SDK subprocess. Without this,
+      // process.env doesn't have CLAUDE_CODE_OAUTH_TOKEN (config.ts keeps
+      // secrets out of process.env) and the SDK fails with "Not logged in".
+      env: claudeCodeSubprocessEnv(),
     }),
   });
   for await (const msg of stream) {

@@ -19,6 +19,7 @@ import { contentHash } from './common.js';
 import {
   MODELS,
   applyOneMillionContextRecovery,
+  claudeCodeSubprocessEnv,
   claudeCodeSystemPrompt,
   looksLikeClaudeOneMillionContextError,
   normalizeClaudeSdkOptionsForOneMillionContext,
@@ -109,6 +110,8 @@ async function ocrPdfViaClaude(filePath: string): Promise<string[]> {
           'You are a faithful OCR transcriber. Copy text exactly as written. When the PDF has images or scans, read the text from them using vision. Never invent content.',
           { minimal: true },
         ),
+        // 1.18.194 — propagate OAuth token to SDK subprocess.
+        env: claudeCodeSubprocessEnv(),
         // Claude Code's built-in Read tool handles PDFs (text + vision)
         tools: ['Read'],
         allowedTools: ['Read'],
