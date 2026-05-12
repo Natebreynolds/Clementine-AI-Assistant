@@ -101,6 +101,31 @@ export function resetComposioClient(): void {
   identityCache.clear();
   catalogCache = null;
   detectedPreferredUserId = null;
+  connectionsCache = null;
+  void busComposioMcpCache();
+}
+
+/**
+ * Drop the per-process connection-list cache so the next call to
+ * `listConnectedToolkits()` hits Composio fresh. Used after authorize /
+ * disconnect / rename so the dashboard and agent see the change immediately.
+ */
+export function clearConnectedToolkitsCache(): void {
+  connectionsCache = null;
+}
+
+/**
+ * Fire-and-forget MCP-server cache bust. Imported lazily to avoid the
+ * client → mcp-bridge → client cycle that an `import { ... }` at the top
+ * would create.
+ */
+async function busComposioMcpCache(): Promise<void> {
+  try {
+    const mod = await import('./mcp-bridge.js');
+    mod.clearComposioMcpCache?.();
+  } catch {
+    /* mcp-bridge optional at boot; safe to ignore */
+  }
 }
 
 // Public: same logic as the internal detector, exposed for the MCP bridge so
@@ -382,9 +407,24 @@ async function getIdentityFor(
   return identity;
 }
 
+// Short-lived per-process cache + stale-while-revalidate. Composio API hiccups
+// between turns used to make tools "vanish" from the chat; with this, a single
+// failed list call falls back to the prior good snapshot. TTL is short enough
+// (60s) that legit reconnects / disconnects show up quickly, and the dashboard
+// auth/disconnect handlers explicitly bust the cache via
+// `clearConnectedToolkitsCache()` for instant reflection.
+let connectionsCache: { at: number; data: ConnectedToolkit[] } | null = null;
+const CONNECTIONS_TTL_MS = 60_000;
+
 export async function listConnectedToolkits(): Promise<ConnectedToolkit[]> {
   const composio = getComposio();
   if (!composio) return [];
+
+  const now = Date.now();
+  if (connectionsCache && now - connectionsCache.at < CONNECTIONS_TTL_MS) {
+    return connectionsCache.data;
+  }
+
   try {
     // No userIds filter: a Composio API key is account-scoped, and a personal
     // agent should see every connection on the account regardless of which
@@ -413,9 +453,17 @@ export async function listConnectedToolkits(): Promise<ConnectedToolkit[]> {
         };
       }),
     );
+    connectionsCache = { at: now, data: enriched };
     return enriched;
   } catch (err) {
-    logger.error({ err }, 'listConnectedToolkits failed');
+    if (connectionsCache) {
+      logger.warn(
+        { err, staleAgeMs: now - connectionsCache.at, items: connectionsCache.data.length },
+        'listConnectedToolkits failed — returning stale cache',
+      );
+      return connectionsCache.data;
+    }
+    logger.error({ err }, 'listConnectedToolkits failed (no cache to fall back to)');
     return [];
   }
 }
@@ -611,6 +659,8 @@ export async function authorizeToolkit(
     // others created in parallel via Composio's web UI) get picked up
     // immediately, even within the 60s TTL window.
     detectedPreferredUserId = null;
+    connectionsCache = null;
+    void busComposioMcpCache();
     return { redirectUrl: conn.redirectUrl ?? null, connectionId: conn.id };
   } catch (err) {
     const status = (err as { status?: number })?.status;
@@ -640,6 +690,8 @@ export async function disconnectToolkit(connectionId: string): Promise<void> {
   if (!composio) throw new Error('COMPOSIO_API_KEY not set');
   await composio.connectedAccounts.delete(connectionId);
   identityCache.delete(connectionId);
+  connectionsCache = null;
+  void busComposioMcpCache();
 }
 
 export async function renameConnection(connectionId: string, alias: string): Promise<void> {
@@ -651,4 +703,5 @@ export async function renameConnection(connectionId: string, alias: string): Pro
   // hatch and the alternative (bypassing the wrapper entirely) loses retry
   // and auth handling.
   await (composio as any).client.connectedAccounts.patch(connectionId, { alias });
+  connectionsCache = null;
 }

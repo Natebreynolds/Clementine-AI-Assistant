@@ -27,6 +27,24 @@ import {
 
 const logger = pino({ name: 'clementine.composio.mcp' });
 
+// Per-toolkit SDK MCP server cache. composio.tools.get() is the expensive part
+// — Outlook returns 400+ tools, GitHub 800+, each with handlers — and the
+// chat path was paying that cost on every single runAgent call. The server
+// instance is a thin wrapper around stable handlers, safe to reuse across
+// query() calls. Busted on authorize / disconnect / API-key reset via
+// `clearComposioMcpCache()`.
+interface CachedServer { at: number; server: McpSdkServerConfigWithInstance }
+const serverCache = new Map<string, CachedServer>();
+const SERVER_CACHE_TTL_MS = 5 * 60_000;
+
+export function clearComposioMcpCache(slug?: string): void {
+  if (slug) {
+    serverCache.delete(slug);
+    return;
+  }
+  serverCache.clear();
+}
+
 /**
  * Build SDK MCP server configs for the given toolkit slugs (or all active
  * connected toolkits when omitted). Each toolkit becomes one MCP server.
@@ -94,6 +112,12 @@ async function buildOne(
   slug: string,
   _connected: Awaited<ReturnType<typeof listConnectedToolkits>>,
 ): Promise<McpSdkServerConfigWithInstance> {
+  const now = Date.now();
+  const cached = serverCache.get(slug);
+  if (cached && now - cached.at < SERVER_CACHE_TTL_MS) {
+    return cached.server;
+  }
+
   // composio.tools.get() returns the FLAT toolkit tools (OUTLOOK_LIST_MESSAGES,
   // GMAIL_SEND_EMAIL, …) — exactly the namespacing the agent expects as
   // mcp__outlook__OUTLOOK_LIST_MESSAGES. The alternative, composio.create()
@@ -107,11 +131,13 @@ async function buildOne(
   // alphabetically come after OUTLOOK_LIST_CALENDAR_GROUP_*. GitHub has
   // 800+. Set 1000 — comfortable headroom for any single toolkit.
   const tools = await fetchToolkitTools(composio, slug);
-  return createSdkMcpServer({
+  const server = createSdkMcpServer({
     name: slug,
     version: '0.1.0',
     tools: tools as any,
   });
+  serverCache.set(slug, { at: now, server });
+  return server;
 }
 
 async function fetchToolkitTools(
