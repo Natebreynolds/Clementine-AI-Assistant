@@ -216,6 +216,9 @@ export interface RunAgentOptions {
   /** Streaming callback when a tool is invoked (name + input). Best-effort. */
   onToolActivity?: (info: { tool: string; input: Record<string, unknown> }) => void | Promise<void>;
 
+  /** Fires after the runId is generated, before SDK execution starts. */
+  onRunStart?: (runId: string) => void;
+
   /** Abort signal — when triggered, the SDK stream is cancelled. */
   abortSignal?: AbortSignal;
 
@@ -525,6 +528,7 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
   // tool-output guard (1.18.169) can namespace its on-disk archive by
   // runId. EventLog writers below also reference this id.
   const runId = randomUUID();
+  try { opts.onRunStart?.(runId); } catch { /* telemetry callback only */ }
   const eventLog = new EventLog();
   let eventSeq = 0;
   const writeEvent = (e: Omit<RunEvent, 'runId' | 'seq'>): void => {

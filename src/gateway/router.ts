@@ -94,6 +94,7 @@ type RecallMode = 'semantic' | 'lexical' | 'both';
 
 type LedgerRunMetadata = {
   runId?: string;
+  runIds?: string[];
   permissionModeApplied?: string;
   allowedToolsApplied?: string[];
   builtinToolsApplied?: string[];
@@ -121,16 +122,54 @@ type FusedRecallRow = {
   topScore: number;
 };
 
-function collectRunToolNames(runId: string | undefined): string[] {
-  if (!runId) return [];
+function rememberRunId(metadata: LedgerRunMetadata | undefined, runId: string | undefined): void {
+  if (!metadata || !runId) return;
+  metadata.runId = runId;
+  const existing = metadata.runIds ?? [];
+  if (!existing.includes(runId)) metadata.runIds = [...existing, runId];
+}
+
+function runIdsFromMetadata(metadata: LedgerRunMetadata | undefined): string[] {
+  if (!metadata) return [];
+  const ids = metadata.runIds ?? [];
+  if (metadata.runId && !ids.includes(metadata.runId)) return [...ids, metadata.runId];
+  return ids;
+}
+
+function collectRunToolNames(runIds: string[] | string | undefined): string[] {
+  const ids = Array.isArray(runIds) ? runIds : runIds ? [runIds] : [];
+  if (ids.length === 0) return [];
   try {
-    return new EventLog()
-      .readByRun(runId)
-      .filter((event) => event.kind === 'tool_call' && typeof event.toolName === 'string' && event.toolName)
-      .map((event) => event.toolName as string);
+    const eventLog = new EventLog();
+    return ids.flatMap((runId) => eventLog
+        .readByRun(runId)
+        .filter((event) => event.kind === 'tool_call' && typeof event.toolName === 'string' && event.toolName)
+        .map((event) => event.toolName as string));
   } catch {
     return [];
   }
+}
+
+function contextOverflowFallbackMessage(): string {
+  return [
+    "That work pushed past the context limit even with autocompact.",
+    "I've reset our conversation. Two ways forward:",
+    "",
+    "1. Rephrase the task in smaller scope (e.g. 'just the first 10' instead of 'all 100')",
+    "2. Use `/plan` to have me decompose it into chained workers before running",
+  ].join('\n');
+}
+
+function detectOverflowResumeReply(message: string): 'continue' | 'cancel' | 'other' {
+  const text = message.trim().toLowerCase();
+  if (!text) return 'other';
+  if (/^(?:continue|resume|proceed|keep going|carry on|yes|yep|yeah|sure|ok|okay|go|go ahead|do it|run it)[\s.!]*$/.test(text)) {
+    return 'continue';
+  }
+  if (/^(?:done|stop|cancel|abort|no|nope|that's all|that is all|leave it|do not continue|don't continue)\b/.test(text)) {
+    return 'cancel';
+  }
+  return 'other';
 }
 
 function compactToolNames(names: string[]): string[] {
@@ -276,6 +315,16 @@ interface SessionState {
     planId: string;
     chainId: string;
     proposedAt: number;
+  };
+  /**
+   * Set when a chat run overflows after operational tool calls completed.
+   * The next short "continue" reply resumes from an event-log summary
+   * instead of making the model rediscover or repeat completed side effects.
+   */
+  pendingOverflowResume?: {
+    runIds: string[];
+    summarizedAt: number;
+    originalRequest: string;
   };
 }
 
@@ -2029,7 +2078,7 @@ export class Gateway {
           throw err;
         } finally {
           try {
-            const eventToolNames = collectRunToolNames(ledgerRunMetadata.runId);
+            const eventToolNames = collectRunToolNames(runIdsFromMetadata(ledgerRunMetadata));
             const effectiveToolNames = eventToolNames.length > 0
               ? compactToolNames([...ledgerToolNames, ...eventToolNames])
               : compactToolNames(ledgerToolNames);
@@ -2452,6 +2501,38 @@ export class Gateway {
         // Use per-message override, then session default, then global default
         const sess = this.sessions.get(sessionKey);
         const effectiveModel = model ?? sess?.model;
+        const pendingOverflow = sess?.pendingOverflowResume;
+        if (pendingOverflow) {
+          const ageMs = Date.now() - pendingOverflow.summarizedAt;
+          if (ageMs > 30 * 60 * 1000) {
+            delete sess.pendingOverflowResume;
+          } else {
+            const reply = detectOverflowResumeReply(originalText);
+            if (reply === 'continue') {
+              try {
+                const { summarizeRunSideEffects, buildContinuationPrompt } = await import('../agent/run-summary.js');
+                const summary = summarizeRunSideEffects(pendingOverflow.runIds);
+                text = buildContinuationPrompt(summary, pendingOverflow.originalRequest);
+                skipBackgroundOffer = true;
+                delete sess.pendingOverflowResume;
+                logger.info({
+                  sessionKey,
+                  runIds: pendingOverflow.runIds,
+                }, 'Overflow recovery: owner approved continuation');
+              } catch (err) {
+                delete sess.pendingOverflowResume;
+                logger.warn({ err, sessionKey, runIds: pendingOverflow.runIds }, 'Overflow recovery: failed to build continuation prompt');
+              }
+            } else if (reply === 'cancel') {
+              delete sess.pendingOverflowResume;
+              const response = 'OK, I will not continue that follow-up work. The completed tool calls stay completed.';
+              this.mirrorChatExchange(sessionKey, originalText, response, { model: 'chat-control' });
+              return response;
+            } else {
+              delete sess.pendingOverflowResume;
+            }
+          }
+        }
         const enrichedText = text;
         let effectiveSessionKey = sessionKey;
         const profileSlug = sess?.profile;
@@ -2947,6 +3028,9 @@ export class Gateway {
               }
               return undefined;
             },
+            onRunStart: (runId: string) => {
+              rememberRunId(ledgerRunMetadata, runId);
+            },
             abortSignal: chatAc.signal,
           });
 
@@ -3007,6 +3091,7 @@ export class Gateway {
           let runAgentResult;
           try {
             runAgentResult = await runAgentOnce(priorSdkSessionId);
+            rememberRunId(ledgerRunMetadata, runAgentResult.runId);
           } catch (err) {
             if (chatAc.signal.aborted || classifyChatError(err) !== 'context_overflow') {
               throw err;
@@ -3017,6 +3102,7 @@ export class Gateway {
             const retried = await maybeRetryFresh();
             if (!retried) throw err;
             runAgentResult = retried;
+            rememberRunId(ledgerRunMetadata, runAgentResult.runId);
           }
 
           if (!chatAc.signal.aborted && runAgentResultIndicatesContextOverflow(runAgentResult)) {
@@ -3028,6 +3114,7 @@ export class Gateway {
               didFreshSessionRetry,
             }, 'Context overflow result — attempting fresh-session retry or surfacing recovery');
             const retried = await maybeRetryFresh();
+            if (retried) rememberRunId(ledgerRunMetadata, retried.runId);
             if (retried && !runAgentResultIndicatesContextOverflow(retried)) {
               runAgentResult = retried;
             } else {
@@ -3036,7 +3123,7 @@ export class Gateway {
           }
 
           if (ledgerRunMetadata) {
-            ledgerRunMetadata.runId = runAgentResult.runId;
+            rememberRunId(ledgerRunMetadata, runAgentResult.runId);
             ledgerRunMetadata.executionMode = ledgerRunMetadata.executionMode ?? 'inline';
             ledgerRunMetadata.skillsApplied = resolvedSkills?.matches.map((m) => ({
               name: m.name,
@@ -3120,31 +3207,37 @@ export class Gateway {
               applyOneMillionContextRecovery();
               this.clearSession(effectiveSessionKey);
               return oneMillionContextRecoveryMessage();
-            case 'context_overflow': {
-              // 1.18.194 — trust the SDK. By the time we see context_overflow
-              // here, the SDK has ALREADY tried autocompact (it's built-in).
-              // Our previous behavior was to compress + retry + queue a
-              // separate planner background task. That layered our own
-              // retry on top of the SDK's, and when any step in the planner
-              // pipeline failed (auth, planning, chain dispatch), users saw
-              // a confusing "Planning failed" message — that's what bit
-              // Zach. SDK best practice: when autocompact + retry have both
-              // failed, that's a real context ceiling. Surface a clean
-              // message that gives the owner two recovery options, clear
-              // the session pointer, and trust them to resend smaller or
-              // opt in to explicit plan mode.
-              logger.info({ sessionKey }, 'Context overflow — autocompact ceiling reached, resetting');
-              this.assistant.clearSession(effectiveSessionKey);
-              const response = [
-                "That work pushed past the context limit even with autocompact.",
-                "I've reset our conversation. Two ways forward:",
-                "",
-                "1. Rephrase the task in smaller scope (e.g. 'just the first 10' instead of 'all 100')",
-                "2. Use `/plan` to have me decompose it into chained workers before running",
-              ].join('\n');
-              this.mirrorChatExchange(sessionKey, originalText, response, { model: 'chat-control' });
-              return response;
-            }
+	            case 'context_overflow': {
+	              // 1.18.200 — if a run overflowed after side-effect tools
+	              // fired, do not pretend "nothing happened." The SDK session
+	              // may be reset, but Clementine's event log still records
+	              // every tool_call/tool_result by runId. Summarize those
+	              // effects, stash a short-lived resume token, and let the
+	              // owner say "continue" to restart from the factual state.
+	              logger.info({ sessionKey }, 'Context overflow — autocompact ceiling reached, resetting');
+	              this.assistant.clearSession(effectiveSessionKey);
+	              let response = contextOverflowFallbackMessage();
+	              const runIds = runIdsFromMetadata(ledgerRunMetadata);
+	              if (runIds.length > 0) {
+	                try {
+	                  const { summarizeRunSideEffects, hasOperationalActivity, formatOverflowRecoveryMessage } = await import('../agent/run-summary.js');
+	                  const summary = summarizeRunSideEffects(runIds);
+	                  if (hasOperationalActivity(summary)) {
+	                    const state = this.getSession(sessionKey);
+	                    state.pendingOverflowResume = {
+	                      runIds,
+	                      summarizedAt: Date.now(),
+	                      originalRequest: originalText,
+	                    };
+	                    response = formatOverflowRecoveryMessage(summary);
+	                  }
+	                } catch (summaryErr) {
+	                  logger.warn({ summaryErr, sessionKey, runIds }, 'Context overflow side-effect summary failed');
+	                }
+	              }
+	              this.mirrorChatExchange(sessionKey, originalText, response, { model: 'chat-control' });
+	              return response;
+	            }
             case 'auth':
               this.recordAuthFailure();
               return "I'm temporarily offline due to an authentication issue. The owner needs to re-authenticate — I'll recover automatically once it's resolved.";

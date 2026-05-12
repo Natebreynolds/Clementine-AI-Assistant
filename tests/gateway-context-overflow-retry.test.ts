@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { rmSync } from 'node:fs';
 
 vi.hoisted(() => {
   const home = `/private/tmp/clementine-gateway-context-retry-${process.pid}`;
@@ -59,6 +60,8 @@ vi.mock('../src/agent/complex-task-detector.js', () => ({
 
 import { buildContextOverflowRetryPrompt, Gateway, runAgentResultIndicatesContextOverflow } from '../src/gateway/router.js';
 import { loadBackgroundTask } from '../src/agent/background-tasks.js';
+import { EventLog } from '../src/gateway/event-log.js';
+import type { RunEvent } from '../src/types.js';
 
 function fakeRunResult(text = 'published dashboard') {
   return {
@@ -107,6 +110,7 @@ function fakeAssistant() {
 
 describe('gateway context overflow retry', () => {
   beforeEach(() => {
+    rmSync(process.env.CLEMENTINE_HOME!, { recursive: true, force: true });
     vi.clearAllMocks();
     mocks.runAgent.mockReset();
     mocks.buildExtraMcpForRunAgent.mockResolvedValue({
@@ -124,6 +128,100 @@ describe('gateway context overflow retry', () => {
     mocks.getEntityRegistry.mockReturnValue([]);
     mocks.findEntitiesInText.mockReturnValue([]);
     mocks.detectComplexTaskForBackground.mockReturnValue(null);
+  });
+
+  it('summarizes side effects across overflow retry runs and resumes from that state', async () => {
+    const assistant = fakeAssistant();
+    const log = new EventLog(process.env.CLEMENTINE_HOME);
+    const append = (over: Partial<RunEvent>) => log.append({
+      runId: 'run-a',
+      seq: 0,
+      ts: '2026-05-12T21:08:00.000Z',
+      kind: 'llm_text',
+      ...over,
+    } as RunEvent);
+
+    mocks.runAgent
+      .mockImplementationOnce(async (_prompt: string, opts: { onRunStart?: (runId: string) => void }) => {
+        opts.onRunStart?.('run-a');
+        append({
+          runId: 'run-a',
+          seq: 0,
+          kind: 'tool_call',
+          toolName: 'mcp__outlook__OUTLOOK_SEND_EMAIL',
+          toolUseId: 'send-1',
+          toolInput: { to: 'kevin@example.com', subject: 'Denver legal search', body: 'hello' },
+        });
+        append({
+          runId: 'run-a',
+          seq: 1,
+          kind: 'tool_result',
+          toolUseId: 'send-1',
+          toolResult: { successful: true, error: null, data: { status_code: 202 }, logId: 'log_1' },
+        });
+        append({
+          runId: 'run-a',
+          seq: 2,
+          kind: 'tool_call',
+          toolName: 'mcp__gmail__GMAIL_SEND_EMAIL',
+          toolUseId: 'send-2',
+          toolInput: { to: 'busby@example.com', subject: 'Tucson legal market', body: 'hello' },
+        });
+        append({
+          runId: 'run-a',
+          seq: 3,
+          kind: 'tool_result',
+          toolUseId: 'send-2',
+          toolResult: { successful: true, error: null, data: { status_code: 202 }, logId: 'log_2' },
+        });
+        throw new Error('Prompt is too long');
+      })
+      .mockImplementationOnce(async (_prompt: string, opts: { onRunStart?: (runId: string) => void }) => {
+        opts.onRunStart?.('run-b');
+        append({
+          runId: 'run-b',
+          seq: 0,
+          kind: 'tool_call',
+          toolName: 'mcp__dataforseo__SEARCH',
+          toolUseId: 'search-1',
+        });
+        append({
+          runId: 'run-b',
+          seq: 1,
+          kind: 'tool_result',
+          toolUseId: 'search-1',
+          toolResult: { successful: true, data: [] },
+        });
+        throw new Error('Autocompact is thrashing');
+      })
+      .mockResolvedValueOnce(fakeRunResult('Salesforce cleanup complete'));
+
+    const gateway = new Gateway(assistant as never) as Gateway & {
+      getAgentManager: () => unknown;
+      _maybeRouteToSpecialist: () => Promise<null>;
+    };
+    gateway.getAgentManager = vi.fn(() => null);
+    gateway._maybeRouteToSpecialist = vi.fn(async () => null);
+
+    const response = await gateway.handleMessage(
+      'discord:user:123',
+      'OK Ross can we fire off those emails now please',
+    );
+
+    expect(response).toContain('work had already happened');
+    expect(response).toContain('2 email sends completed');
+    expect(response).toContain('kevin@example.com');
+    expect(response).toContain('busby@example.com');
+    expect(response).toContain('Reply `continue`');
+
+    const continued = await gateway.handleMessage('discord:user:123', 'continue');
+    expect(continued).toBe('Salesforce cleanup complete');
+    expect(mocks.runAgent).toHaveBeenCalledTimes(3);
+    const continuationPrompt = mocks.runAgent.mock.calls[2]![0] as string;
+    expect(continuationPrompt).toContain('DO NOT re-run completed side effects');
+    expect(continuationPrompt).toContain('kevin@example.com');
+    expect(continuationPrompt).toContain('busby@example.com');
+    expect(continuationPrompt).toContain('Focus on remaining follow-up');
   });
 
   it('retries with fresh SDK session when overflow happens on a resumed session (1.18.196)', async () => {
