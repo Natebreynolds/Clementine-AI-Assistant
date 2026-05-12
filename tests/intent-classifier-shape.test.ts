@@ -10,7 +10,7 @@
  *     chat path (no regression)
  */
 import { describe, it, expect } from 'vitest';
-import { classifyMessageShape, detectPlanApproval } from '../src/agent/intent-classifier.js';
+import { classifyMessageShape, detectPlanApproval, detectPlanModeRequest } from '../src/agent/intent-classifier.js';
 
 describe('classifyMessageShape — simple', () => {
   it('one-word casual = simple', () => {
@@ -166,5 +166,67 @@ describe('detectPlanApproval', () => {
     expect(detectPlanApproval('what time is it?')).toBe('other');
     expect(detectPlanApproval('huh')).toBe('other');
     expect(detectPlanApproval('uhhh')).toBe('other');
+  });
+});
+
+describe('detectPlanModeRequest (1.18.193 — opt-in plan mode)', () => {
+  it('triggers on /plan prefix', () => {
+    const result = detectPlanModeRequest('/plan build me a coaches HTML report');
+    expect(result.requested).toBe(true);
+    if (result.requested) {
+      expect(result.cleaned).toBe('build me a coaches HTML report');
+    }
+  });
+
+  it('triggers on /plan with leading whitespace', () => {
+    const result = detectPlanModeRequest('  /plan find the project and deploy');
+    expect(result.requested).toBe(true);
+    if (result.requested) {
+      expect(result.cleaned).toBe('find the project and deploy');
+    }
+  });
+
+  it('triggers case-insensitively', () => {
+    const result = detectPlanModeRequest('/PLAN do the thing');
+    expect(result.requested).toBe(true);
+  });
+
+  it('triggers on [plan-mode] token anywhere', () => {
+    const result = detectPlanModeRequest('Build me a report [plan-mode] for the coaches');
+    expect(result.requested).toBe(true);
+    if (result.requested) {
+      // Token stripped, surrounding text preserved
+      expect(result.cleaned).toContain('Build me a report');
+      expect(result.cleaned).toContain('for the coaches');
+      expect(result.cleaned).not.toContain('[plan-mode]');
+    }
+  });
+
+  it('does NOT trigger on multi-step language without explicit opt-in', () => {
+    // This is Nora's April 28-29 vibe — multi-step but no explicit /plan.
+    // Should fall through to normal chat (Sonnet just runs it).
+    expect(detectPlanModeRequest('lets knock out touch 4 for legalweek').requested).toBe(false);
+    expect(detectPlanModeRequest('pull contacts from salesforce, send via gmail').requested).toBe(false);
+    expect(detectPlanModeRequest('send 25 salesforce emails after you scrape them').requested).toBe(false);
+  });
+
+  it('does NOT trigger on incidental "plan" mentions', () => {
+    expect(detectPlanModeRequest('what is the plan for today').requested).toBe(false);
+    expect(detectPlanModeRequest('I have a plan').requested).toBe(false);
+    expect(detectPlanModeRequest('we should plan this').requested).toBe(false);
+  });
+
+  it('handles empty / whitespace gracefully', () => {
+    expect(detectPlanModeRequest('').requested).toBe(false);
+    expect(detectPlanModeRequest('   ').requested).toBe(false);
+  });
+
+  it('strips trigger but preserves the rest of the message exactly', () => {
+    const result = detectPlanModeRequest('/plan   build a thing\nand deploy it');
+    expect(result.requested).toBe(true);
+    if (result.requested) {
+      // Internal whitespace/newlines preserved
+      expect(result.cleaned).toBe('build a thing\nand deploy it');
+    }
   });
 });

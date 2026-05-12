@@ -627,7 +627,7 @@ export class Gateway {
     onText?: ((text: string) => void) | undefined;
   }): Promise<{ handled: true; response: string } | { handled: false }> {
     const sess = this.sessions.get(opts.sessionKey);
-    const { detectPlanApproval } = await import('../agent/intent-classifier.js');
+    const { detectPlanApproval, detectPlanModeRequest } = await import('../agent/intent-classifier.js');
     const { planRequest, savePlan, loadPlan } = await import('../agent/bg-planner.js');
     const { dispatchChain } = await import('../agent/bg-orchestrator.js');
 
@@ -703,16 +703,36 @@ export class Gateway {
       return { handled: false };
     }
 
-    // ── Path B: multi-step entry ────────────────────────────────────
-    if (opts.shape === 'multi-step' && sess) {
+    // ── Path B: explicit plan-mode entry (1.18.193) ─────────────────
+    //
+    // Plan mode is now OPT-IN, not auto-triggered by message shape.
+    // Default chat behavior matches 1.18.62: the SDK query runs the
+    // work in one continuous Sonnet session, like Nora did on April
+    // 28-29 (38 Bash calls in one session — no decomposition needed).
+    //
+    // The planner-orchestrator remains available for genuinely huge
+    // jobs, but the owner has to opt in:
+    //
+    //   - Message starts with `/plan` (case-insensitive)
+    //   - Message contains `[plan-mode]` token anywhere
+    //
+    // The chat-overflow escape hatch (queueBackgroundTaskAfterContext-
+    // Overflow → planner) still works as a separate path when the SDK
+    // session ACTUALLY overflows. That's the legitimate "this job is
+    // too big for one session" trigger.
+    //
+    // We keep shape classification (it still gates turn-context
+    // density for token savings on 'simple' messages), but shape no
+    // longer routes execution.
+    const planRequestSignal = detectPlanModeRequest(opts.userMessage);
+    if (planRequestSignal.requested && sess) {
+      const cleanedRequest = planRequestSignal.cleaned;
       try {
-        // Stream a "thinking..." update so the user knows planning is
-        // happening rather than seeing 30s of silence.
         if (opts.onText) {
           try { opts.onText('🤔 Planning the steps...'); } catch { /* non-fatal */ }
         }
         const plan = await planRequest({
-          userRequest: opts.userMessage,
+          userRequest: cleanedRequest || opts.userMessage,
           originatingSessionKey: opts.sessionKey,
           ...(opts.activeProject ? { project: opts.activeProject } : {}),
         });
@@ -727,13 +747,15 @@ export class Gateway {
           response: this._formatPlanForApproval(plan, /* revised */ false),
         };
       } catch (err) {
-        logger.warn({ err, sessionKey: opts.sessionKey }, 'Plan mode: planRequest failed at entry');
+        logger.warn({ err, sessionKey: opts.sessionKey }, 'Plan mode: planRequest failed at explicit entry');
         // Fall through to normal chat. Better than blocking the owner.
         return { handled: false };
       }
     }
 
     // Not a plan-mode case — fall through to normal chat.
+    // This is the path 99% of messages take. Like 1.18.62 — the SDK
+    // query runs the work in one continuous Sonnet session.
     return { handled: false };
   }
 

@@ -430,6 +430,42 @@ export function detectPlanApproval(message: string): PlanApprovalSignal {
 }
 
 /**
+ * 1.18.193 — plan-mode opt-in detector.
+ *
+ * Plan-mode used to auto-trigger when `classifyMessageShape` flagged a
+ * message as 'multi-step'. That was too aggressive — Nora's April 28-29
+ * work (38 Bash calls in one chat session) would have been routed through
+ * the planner unnecessarily. Comparison vs friend's 1.18.62 install showed
+ * the auto-route was the main behavior divergence.
+ *
+ * Now plan-mode is opt-in via explicit owner intent:
+ *   - Message starts with `/plan` (case-insensitive)
+ *   - Message contains the `[plan-mode]` token anywhere
+ *
+ * The chat-overflow recovery path (queueBackgroundTaskAfterContextOverflow)
+ * still routes to the planner when the SDK session ACTUALLY overflows —
+ * that's a separate escape hatch, not an auto-trigger.
+ *
+ * Returns `{ requested: true, cleaned }` if the owner asked for plan mode,
+ * where `cleaned` is the message with the trigger token stripped.
+ * Returns `{ requested: false }` otherwise.
+ */
+export type PlanModeRequest =
+  | { requested: true; cleaned: string }
+  | { requested: false };
+
+const PLAN_MODE_TRIGGER = /^\s*\/plan\b|\[plan-mode\]/i;
+
+export function detectPlanModeRequest(message: string): PlanModeRequest {
+  if (!message || !PLAN_MODE_TRIGGER.test(message)) return { requested: false };
+  const cleaned = message
+    .replace(/^\s*\/plan\b\s*/i, '')
+    .replace(/\[plan-mode\]/gi, '')
+    .trim();
+  return { requested: true, cleaned };
+}
+
+/**
  * Generate a follow-up suggestion prompt suffix based on completed work.
  *
  * @param toolCallCount - Number of tool calls made during the query
