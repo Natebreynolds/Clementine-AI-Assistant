@@ -13,6 +13,7 @@ import {
 } from '../config.js';
 import type { NotificationDispatcher } from '../gateway/notifications.js';
 import type { Gateway } from '../gateway/router.js';
+import { isSilentGatewayResponse } from '../gateway/router.js';
 import { detectApprovalReply } from '../agent/local-turn.js';
 
 const logger = pino({ name: 'clementine.telegram' });
@@ -122,6 +123,13 @@ class TelegramStreamingMessage {
     }
   }
 
+  async discard(): Promise<void> {
+    this.isFinal = true;
+    if (this.messageId !== null) {
+      await this.bot.api.deleteMessage(this.chatId, this.messageId).catch(() => {});
+    }
+  }
+
   private async flush(): Promise<void> {
     if (this.messageId === null || !this.pendingText || this.isFinal) return;
     let display = mdToTelegram(this.pendingText);
@@ -194,6 +202,10 @@ export async function startTelegram(
         async (toolName) => { streamer.setStatus(`using ${toolName}...`); },
         async (status) => { streamer.setStatus(status); },
       );
+      if (isSilentGatewayResponse(response)) {
+        await streamer.discard();
+        return;
+      }
       await streamer.finalize(response);
     } catch (err) {
       logger.error({ err }, 'Error processing Telegram message');
@@ -231,6 +243,10 @@ export async function startTelegram(
         async (toolName) => { streamer.setStatus(`using ${toolName}...`); },
         async (status) => { streamer.setStatus(status); },
       );
+      if (isSilentGatewayResponse(response)) {
+        await streamer.discard();
+        return;
+      }
       await streamer.finalize(response);
     } catch (err) {
       logger.error({ err }, 'Error processing Telegram photo');
@@ -272,6 +288,10 @@ export async function startTelegram(
         async (toolName) => { streamer.setStatus(`using ${toolName}...`); },
         async (status) => { streamer.setStatus(status); },
       );
+      if (isSilentGatewayResponse(response)) {
+        await streamer.discard();
+        return;
+      }
       await streamer.finalize(response);
     } catch (err) {
       logger.error({ err }, 'Error processing Telegram document');

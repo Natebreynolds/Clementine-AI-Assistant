@@ -58,7 +58,7 @@ vi.mock('../src/agent/complex-task-detector.js', () => ({
   detectComplexTaskForBackground: mocks.detectComplexTaskForBackground,
 }));
 
-import { buildContextOverflowRetryPrompt, Gateway, runAgentResultIndicatesContextOverflow } from '../src/gateway/router.js';
+import { buildContextOverflowRetryPrompt, Gateway, runAgentResultIndicatesContextOverflow, SILENT_GATEWAY_RESPONSE } from '../src/gateway/router.js';
 import { loadBackgroundTask } from '../src/agent/background-tasks.js';
 import { EventLog } from '../src/gateway/event-log.js';
 import type { RunEvent } from '../src/types.js';
@@ -424,6 +424,40 @@ describe('gateway context overflow retry', () => {
     expect(response).toBe('deployed to Netlify');
     expect(response).not.toContain('Queued background task');
     expect(mocks.runAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not let a stopped prior run answer over the next user message', async () => {
+    const assistant = fakeAssistant();
+    let firstRunStarted!: () => void;
+    const firstRunReady = new Promise<void>((resolve) => { firstRunStarted = resolve; });
+    mocks.runAgent
+      .mockImplementationOnce(async (_prompt: string, opts: { abortSignal?: AbortSignal }) => {
+        firstRunStarted();
+        await new Promise((_resolve, reject) => {
+          opts.abortSignal?.addEventListener('abort', () => reject(new Error('aborted by user')), { once: true });
+        });
+        return fakeRunResult('should not return');
+      })
+      .mockResolvedValueOnce(fakeRunResult('sent directly'));
+
+    const gateway = new Gateway(assistant as never) as Gateway & {
+      getAgentManager: () => unknown;
+      _maybeRouteToSpecialist: () => Promise<null>;
+    };
+    gateway.getAgentManager = vi.fn(() => null);
+    gateway._maybeRouteToSpecialist = vi.fn(async () => null);
+
+    const first = gateway.handleMessage('discord:user:123', 'do a long outreach run');
+    await firstRunReady;
+
+    const stop = await gateway.handleMessage('discord:user:123', 'stop');
+    const next = await gateway.handleMessage('discord:user:123', 'you can send directly please');
+    const firstResponse = await first;
+
+    expect(stop).toContain('Stopping');
+    expect(firstResponse).toBe(SILENT_GATEWAY_RESPONSE);
+    expect(next).toBe('sent directly');
+    expect(mocks.runAgent).toHaveBeenCalledTimes(2);
   });
 
   it('surfaces clean recovery message when both attempts overflow', async () => {

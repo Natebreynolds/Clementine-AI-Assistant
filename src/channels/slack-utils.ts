@@ -148,6 +148,21 @@ export class SlackStreamingMessage {
     }
   }
 
+  async discard(): Promise<void> {
+    this.isFinal = true;
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    if (this.progressTimer) {
+      clearInterval(this.progressTimer);
+      this.progressTimer = null;
+    }
+    if (this.ts) {
+      await this.client.chat.delete({ channel: this.channel, ts: this.ts }).catch(() => {});
+    }
+  }
+
   /** Format elapsed milliseconds as human-readable duration. */
   private formatElapsed(ms: number): string {
     const s = Math.floor(ms / 1000);

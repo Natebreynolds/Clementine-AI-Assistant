@@ -259,6 +259,12 @@ export function runAgentResultIndicatesContextOverflow(result: { subtype?: strin
 
 export type ChatErrorKind = 'rate_limit' | 'one_million_context' | 'context_overflow' | 'auth' | 'billing' | 'transient' | 'unknown';
 
+export const SILENT_GATEWAY_RESPONSE = '__clementine_silent_response__';
+
+export function isSilentGatewayResponse(text: string): boolean {
+  return text === SILENT_GATEWAY_RESPONSE;
+}
+
 export function classifyChatError(err: unknown): ChatErrorKind {
   const msg = String(err);
   if (isCreditBalanceError(msg)) return 'billing';
@@ -284,6 +290,12 @@ interface SessionState {
   project?: ProjectMeta;
   lock?: Promise<void>;
   abortController?: AbortController;
+  /**
+   * When a run is aborted because the owner explicitly stopped it or sent a
+   * replacement message, the aborted handler must not emit a stale "Stopped"
+   * response after the newer turn has already moved on.
+   */
+  suppressAbortResponseFor?: AbortSignal;
   /**
    * Abort controllers for in-flight team tasks spawned from this session.
    * `stopSession` aborts every one of these so "Stop" actually halts the
@@ -1944,7 +1956,8 @@ export class Gateway {
     let aborted = false;
     const ac = s?.abortController;
     if (ac && !ac.signal.aborted) {
-      ac.abort();
+      if (s) s.suppressAbortResponseFor = ac.signal;
+      ac.abort('user-stop');
       aborted = true;
     }
     if (s?.teamTaskControllers?.size) {
@@ -1973,6 +1986,7 @@ export class Gateway {
       if (s.abortController && !s.abortController.signal.aborted) {
         const partial = s.lastStreamedText ?? '';
         s.pendingInterrupt = { partial, interruptedAt: Date.now() };
+        s.suppressAbortResponseFor = s.abortController.signal;
         logger.info({ sessionKey, partialLen: partial.length }, 'New message arrived — interrupting in-flight query');
         // Pass a reason string so assistant.ts can distinguish this from a
         // timeout abort and show the right final message.
@@ -2305,6 +2319,7 @@ export class Gateway {
       if (recentContext.responseText) {
         const current = this.sessions.get(sessionKey);
         if (current?.abortController && !current.abortController.signal.aborted) {
+          current.suppressAbortResponseFor = current.abortController.signal;
           current.abortController.abort('replaced-by-recent-context');
           logger.info({ sessionKey }, 'Interrupted active chat for recent operational context response');
         }
@@ -3192,9 +3207,17 @@ export class Gateway {
         } catch (err) {
           clearTimeout(chatTimer);
           if (hardWallTimer) clearTimeout(hardWallTimer);
-          { const cs = this.sessions.get(sessionKey); if (cs) delete cs.abortController; }
+          const cs = this.sessions.get(sessionKey);
+          const suppressAbortResponse = cs?.suppressAbortResponseFor === chatAc.signal
+            || chatAc.signal.reason === 'interrupted-by-new-message'
+            || chatAc.signal.reason === 'replaced-by-recent-context'
+            || chatAc.signal.reason === 'user-stop';
+          if (cs) {
+            delete cs.abortController;
+            if (cs.suppressAbortResponseFor === chatAc.signal) delete cs.suppressAbortResponseFor;
+          }
           if (chatAc.signal.aborted) {
-            return "Stopped. What would you like to do instead?";
+            return suppressAbortResponse ? SILENT_GATEWAY_RESPONSE : "Stopped. What would you like to do instead?";
           }
 
           const errKind = classifyChatError(err);

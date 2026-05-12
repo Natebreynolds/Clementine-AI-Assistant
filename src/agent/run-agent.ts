@@ -105,6 +105,7 @@ import {
 } from '../config.js';
 import { buildGuardHooks, type ToolOutputGuardConfig } from './tool-output-guard.js';
 import { buildDedupHook } from './tool-call-dedup.js';
+import { buildSideEffectIdempotencyHook } from './side-effect-idempotency.js';
 import { buildChatStopHook } from './chat-stop-hook.js';
 import type { AgentProfile } from '../types.js';
 import type { AgentManager } from './agent-manager.js';
@@ -624,6 +625,25 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
     },
   });
 
+  // ── Side-effect idempotency hook (1.18.201) ────────────────────────
+  // Prevents exact duplicate high-confidence external mutations across
+  // context-overflow resumes/retries. This is intentionally narrow:
+  // confident email sends and CRM mutations only, keyed by stable identity
+  // fields. Unknown side effects remain event-log/audit data, not blocks.
+  const idempotency = buildSideEffectIdempotencyHook({
+    runId,
+    sessionKey: opts.sessionKey,
+    onDecision: (info) => {
+      if (info.decision !== 'block') return;
+      writeEvent({
+        kind: 'error',
+        ts: new Date().toISOString(),
+        sessionId,
+        toolError: `_clementine_idempotency:block ${info.toolName} ${info.summary ?? ''}`.trim(),
+      });
+    },
+  });
+
   // ── Chat persistence Stop hook (1.18.184, source='chat' only) ─────
   // Keeps chat-initiated multi-step jobs running until they finish.
   // Inspects the model's last assistant message for continuation
@@ -655,6 +675,10 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
   // Merge hook maps from the modules. SDK accepts arrays of
   // HookCallbackMatcher per event; we concatenate.
   const mergedHooks: typeof guard.hooks = { ...guard.hooks };
+  for (const [evt, matchers] of Object.entries(idempotency.hooks) as Array<[keyof typeof idempotency.hooks, NonNullable<typeof idempotency.hooks[keyof typeof idempotency.hooks]>]>) {
+    const existing = mergedHooks[evt] ?? [];
+    mergedHooks[evt] = [...existing, ...matchers];
+  }
   for (const [evt, matchers] of Object.entries(dedup.hooks) as Array<[keyof typeof dedup.hooks, NonNullable<typeof dedup.hooks[keyof typeof dedup.hooks]>]>) {
     const existing = mergedHooks[evt] ?? [];
     mergedHooks[evt] = [...existing, ...matchers];
@@ -1008,6 +1032,12 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
       inspected: dedup.stats.inspected,
       warned: dedup.stats.warned,
       blocked: dedup.stats.blocked,
+    } : undefined,
+    idempotency: idempotency.stats.guarded > 0 ? {
+      guarded: idempotency.stats.guarded,
+      blocked: idempotency.stats.blocked,
+      recorded: idempotency.stats.recorded,
+      failedNotRecorded: idempotency.stats.failedNotRecorded,
     } : undefined,
   }, 'runAgent: query complete');
 

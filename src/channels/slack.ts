@@ -15,6 +15,7 @@ import {
 } from '../config.js';
 import type { NotificationDispatcher } from '../gateway/notifications.js';
 import type { Gateway } from '../gateway/router.js';
+import { isSilentGatewayResponse } from '../gateway/router.js';
 import type { SlackBotManager } from './slack-bot-manager.js';
 import { mdToSlack, sendChunkedSlack, SlackStreamingMessage } from './slack-utils.js';
 import { friendlyToolName } from './discord-utils.js';
@@ -165,6 +166,10 @@ export async function startSlack(
         async (toolName, toolInput) => { streamer.setToolStatus(friendlyToolName(toolName, toolInput)); },
         async (status) => { streamer.setToolStatus(status); },
       );
+      if (isSilentGatewayResponse(response)) {
+        await streamer.discard();
+        return;
+      }
       await streamer.finalize(response);
 
       // Track bot message for feedback reactions

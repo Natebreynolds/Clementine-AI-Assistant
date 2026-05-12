@@ -54,6 +54,7 @@ import type { HeartbeatScheduler } from '../gateway/heartbeat-scheduler.js';
 import type { CronScheduler } from '../gateway/cron-scheduler.js';
 import type { NotificationDispatcher } from '../gateway/notifications.js';
 import type { Gateway } from '../gateway/router.js';
+import { isSilentGatewayResponse } from '../gateway/router.js';
 import { findProjectByName, getLinkedProjects } from '../agent/assistant.js';
 import { detectApprovalReply } from '../agent/local-turn.js';
 import { normalizeToolsetName } from '../agent/toolsets.js';
@@ -918,6 +919,11 @@ export async function startDiscord(
       const streamer = new DiscordStreamingMessage(message.channel);
       await streamer.start();
       const response = await heartbeat.runManual();
+      if (isSilentGatewayResponse(response)) {
+        await streamer.discard();
+        updatePresence(sessionKey);
+        return;
+      }
       await streamer.finalize(response);
       // Inject into DM session so follow-up conversation has context
       gateway.injectContext(sessionKey, '!heartbeat', response);
@@ -975,6 +981,11 @@ export async function startDiscord(
         const streamer = new DiscordStreamingMessage(message.channel);
         await streamer.start();
         const response = await cronScheduler.runManual(jobName);
+        if (isSilentGatewayResponse(response)) {
+          await streamer.discard();
+          updatePresence(sessionKey);
+          return;
+        }
         await streamer.finalize(response);
         // Inject into DM session so follow-up conversation has context
         gateway.injectContext(sessionKey, `!cron run ${jobName}`, response);
@@ -1024,6 +1035,11 @@ export async function startDiscord(
         const streamer = new DiscordStreamingMessage(message.channel);
         await streamer.start();
         const response = await cronScheduler.runWorkflow(wfName, inputs);
+        if (isSilentGatewayResponse(response)) {
+          await streamer.discard();
+          updatePresence(sessionKey);
+          return;
+        }
         await streamer.finalize(response);
         gateway.injectContext(sessionKey, `!workflow run ${wfName}`, response);
         return;
@@ -1353,6 +1369,11 @@ export async function startDiscord(
         (toolName, toolInput) => { streamer.setToolStatus(friendlyToolName(toolName, toolInput)); return Promise.resolve(); },
         (status) => { streamer.setToolStatus(status); return Promise.resolve(); },
       );
+      if (isSilentGatewayResponse(response)) {
+        await streamer.discard();
+        updatePresence(sessionKey);
+        return;
+      }
       await streamer.finalize(response);
       updatePresence(sessionKey);
 
@@ -2025,6 +2046,11 @@ export async function startDiscord(
         agentMessage,
         (t) => streamer.update(t),
       );
+      if (isSilentGatewayResponse(response)) {
+        await streamer.discard();
+        updatePresence(sessionKey);
+        return;
+      }
       await streamer.finalize(response);
     } catch (err) {
       logger.error({ err }, 'Error processing button interaction');
@@ -2314,4 +2340,3 @@ export async function startDiscord(
   logger.info('Starting Discord bot...');
   await client.login(DISCORD_TOKEN);
 }
-

@@ -300,6 +300,21 @@ export class DiscordStreamingMessage {
     }
   }
 
+  async discard(): Promise<void> {
+    this.isFinal = true;
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    if (this.progressTimer) {
+      clearInterval(this.progressTimer);
+      this.progressTimer = null;
+    }
+    if (this.message) {
+      await this.message.delete().catch(() => {});
+    }
+  }
+
   /** Format elapsed milliseconds as human-readable duration. */
   private formatElapsed(ms: number): string {
     const s = Math.floor(ms / 1000);
@@ -413,4 +428,3 @@ export function formatCronEmbed(text: string): EmbedBuilder | null {
 
   return embed;
 }
-
