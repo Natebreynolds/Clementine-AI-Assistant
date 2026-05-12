@@ -104,6 +104,13 @@ export interface BuildTurnContextOptions {
    *  source/output file inventory, and deploy.json summary (if any).
    *  Set by the router's resolver before the chat call. */
   activeProject?: ProjectMeta | null;
+  /** 1.18.191 — message shape from intent-classifier. When 'simple',
+   *  we skip the heavyweight sections (memory recall, bg-task headlines,
+   *  dispute gate) and only emit identity + live state. Saves ~3-4KB
+   *  of injected tokens per routine chat turn. 'multi-step' and
+   *  'unknown' keep the full block. Defaults to 'unknown' = full block
+   *  for back-compat. */
+  messageShape?: 'simple' | 'multi-step' | 'unknown';
 }
 
 export interface BuildTurnContextResult {
@@ -147,12 +154,27 @@ export function buildClementineTurnContext(
   const nowMs = (opts.now ?? Date.now)();
   const nowDate = new Date(nowMs);
 
+  // 1.18.191 — intent-aware section gating. For 'simple' messages
+  // (one-line questions, casual chat, brief asks), the heavy sections
+  // (memory recall, bg-task headlines, dispute gate) are skipped so
+  // every routine turn doesn't pay 3-4KB of injected tokens for
+  // context the model doesn't need. Identity + live state still
+  // render — they're cheap and always useful. Active project still
+  // renders when the message references it. 'multi-step' and
+  // 'unknown' keep the full block.
+  const messageShape = opts.messageShape ?? 'unknown';
+  const isSimpleMessage = messageShape === 'simple';
+
   // 1.18.187 — detect dispute pattern (Part E). When the owner is
   // reporting a failure of prior work, we want to suppress "past
   // success" recall items (they bias the model toward defending its
   // memory instead of verifying reality) and add a verification
   // directive at the top of the block.
-  const disputeDetected = detectDisputePattern(opts.userMessage);
+  // 1.18.191 — also suppressed for 'simple' shape since dispute
+  // patterns rarely co-occur with simple messages, and the gate
+  // produces a multi-paragraph directive we don't want to inject
+  // when the message is just "what time is it".
+  const disputeDetected = !isSimpleMessage && detectDisputePattern(opts.userMessage);
   sections.disputeDetected = disputeDetected;
   if (disputeDetected) {
     parts.push(
@@ -185,7 +207,14 @@ export function buildClementineTurnContext(
   // hits from the SQLite memory store, scored against the user's
   // current message. Without this, Clementine has no automatic recall
   // — she'd have to spontaneously call memory_search every turn.
-  if (opts.memoryStore?.searchContext && opts.userMessage.trim().length > 0) {
+  //
+  // 1.18.191 — skipped for 'simple' messages. "What time is it" doesn't
+  // need 6 memory hits injected; she has the recall tools and can call
+  // them on demand when the message warrants it. Saves ~2KB/turn on
+  // routine chat. The owner's own posture directive
+  // (BEHAVIORAL_POSTURE in run-agent-context.ts) tells the model to
+  // call memory_search proactively when relevant — that still works.
+  if (!isSimpleMessage && opts.memoryStore?.searchContext && opts.userMessage.trim().length > 0) {
     try {
       const hits = opts.memoryStore.searchContext(opts.userMessage, {
         limit: MAX_MEMORY_HITS,
@@ -220,7 +249,12 @@ export function buildClementineTurnContext(
   // that bias the model toward "but my memory says it succeeded."
   // Failed/aborted/interrupted tasks STAY because they're useful
   // signal for the verification posture.
-  if (opts.listBackgroundTasks) {
+  //
+  // 1.18.191 — skipped for 'simple' messages. Routine chat doesn't
+  // need to know what bg tasks landed in the last 24h. If the user
+  // asks "what happened with X" — that's a multi-step / unknown
+  // shape, this section will fire normally.
+  if (!isSimpleMessage && opts.listBackgroundTasks) {
     try {
       const TERMINAL: Array<BackgroundTask['status']> = disputeDetected
         ? ['failed', 'interrupted', 'aborted']

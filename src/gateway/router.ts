@@ -263,6 +263,22 @@ interface SessionState {
    * Consumed exactly once.
    */
   pendingInterrupt?: { partial: string; interruptedAt: number };
+  /**
+   * 1.18.191 — plan mode awaiting owner approval.
+   *
+   * When the message classifier detects 'multi-step' shape and chat
+   * triggers plan-mode, the planner emits a Plan, posts it to chat
+   * as "here's how I'll do this — approve to start?", and stores the
+   * plan id here. The next user message is classified via
+   * `detectPlanApproval`: approve → dispatchChain, revise → re-plan
+   * with feedback, cancel → clear this field. The pending Plan
+   * itself lives on disk via savePlan.
+   */
+  planAwaitingApproval?: {
+    planId: string;
+    chainId: string;
+    proposedAt: number;
+  };
 }
 
 /** Map tool names to user-friendly progress labels for streaming indicators. */
@@ -579,6 +595,171 @@ export class Gateway {
         `Use \`status ${task.id}\` or the dashboard Background Tasks panel for progress.`,
       ].join('\n'),
     };
+  }
+
+  /**
+   * 1.18.191 — chat-side plan mode state machine.
+   *
+   * Two paths it handles:
+   *
+   *   A. Approval-pending path. If sess.planAwaitingApproval is set,
+   *      the user's message NOW is either approval / revision / cancel.
+   *      Approval → dispatch the chain. Revision → re-plan with feedback.
+   *      Cancel → clear pending state.
+   *
+   *   B. Multi-step entry path. shape='multi-step' AND no pending plan:
+   *      run planRequest synchronously, post the plan to chat asking
+   *      for approval, set pending state. The owner's NEXT message
+   *      advances via path A.
+   *
+   * Returns `{ handled: true, response }` when plan mode owns this turn
+   * (caller should return the response without running normal chat).
+   * Returns `{ handled: false }` to fall through to normal chat.
+   *
+   * Defensive on every external call — failures degrade to normal chat
+   * rather than blocking the owner's conversation.
+   */
+  private async _maybeHandlePlanMode(opts: {
+    sessionKey: string;
+    userMessage: string;
+    shape: 'simple' | 'multi-step' | 'unknown';
+    activeProject: ProjectMeta | null;
+    onText?: ((text: string) => void) | undefined;
+  }): Promise<{ handled: true; response: string } | { handled: false }> {
+    const sess = this.sessions.get(opts.sessionKey);
+    const { detectPlanApproval } = await import('../agent/intent-classifier.js');
+    const { planRequest, savePlan, loadPlan } = await import('../agent/bg-planner.js');
+    const { dispatchChain } = await import('../agent/bg-orchestrator.js');
+
+    // ── Path A: approval-pending ────────────────────────────────────
+    if (sess?.planAwaitingApproval) {
+      const pending = sess.planAwaitingApproval;
+      const signal = detectPlanApproval(opts.userMessage);
+      logger.info({
+        sessionKey: opts.sessionKey,
+        planId: pending.planId,
+        chainId: pending.chainId,
+        signal,
+      }, 'Plan mode: approval signal received');
+
+      const plan = loadPlan(pending.planId, opts.activeProject?.path);
+      if (!plan) {
+        // Plan disappeared from disk — clear the pending state and
+        // let the message fall through to normal chat.
+        delete sess.planAwaitingApproval;
+        logger.warn({ planId: pending.planId }, 'Plan mode: pending plan not found on disk — clearing');
+        return { handled: false };
+      }
+
+      if (signal === 'approve') {
+        try {
+          const firstTask = dispatchChain(plan);
+          delete sess.planAwaitingApproval;
+          const response = [
+            `**Plan approved — starting step 1: ${plan.steps[0]?.title ?? '(first step)'}**`,
+            '',
+            `Background task **${firstTask.id}** is now running.`,
+            'I\'ll post step-by-step updates as each step completes.',
+          ].join('\n');
+          return { handled: true, response };
+        } catch (err) {
+          logger.warn({ err, planId: plan.id }, 'Plan mode: dispatchChain failed on approval');
+          return { handled: true, response: `Couldn't start the chain: ${String(err).slice(0, 200)}. Tell me to retry or try a different approach.` };
+        }
+      }
+
+      if (signal === 'cancel') {
+        delete sess.planAwaitingApproval;
+        return { handled: true, response: 'Cancelled the plan. Tell me what you\'d like to do instead.' };
+      }
+
+      if (signal === 'revise') {
+        // Re-plan with the user's revision as additional context.
+        try {
+          const revisedRequest = `${plan.userRequest}\n\n[Revision from owner: ${opts.userMessage}]`;
+          const newPlan = await planRequest({
+            userRequest: revisedRequest,
+            originatingSessionKey: opts.sessionKey,
+            ...(opts.activeProject ? { project: opts.activeProject } : {}),
+          });
+          savePlan(newPlan, newPlan.projectPath);
+          sess.planAwaitingApproval = {
+            planId: newPlan.id,
+            chainId: newPlan.chainId,
+            proposedAt: Date.now(),
+          };
+          return {
+            handled: true,
+            response: this._formatPlanForApproval(newPlan, /* revised */ true),
+          };
+        } catch (err) {
+          logger.warn({ err }, 'Plan mode: revision planRequest failed');
+          return { handled: true, response: `Couldn't revise the plan: ${String(err).slice(0, 200)}. Want me to start fresh or try something else?` };
+        }
+      }
+
+      // signal='other' — let it fall through to normal chat, but keep
+      // pending state. The model will see the user message normally.
+      return { handled: false };
+    }
+
+    // ── Path B: multi-step entry ────────────────────────────────────
+    if (opts.shape === 'multi-step' && sess) {
+      try {
+        // Stream a "thinking..." update so the user knows planning is
+        // happening rather than seeing 30s of silence.
+        if (opts.onText) {
+          try { opts.onText('🤔 Planning the steps...'); } catch { /* non-fatal */ }
+        }
+        const plan = await planRequest({
+          userRequest: opts.userMessage,
+          originatingSessionKey: opts.sessionKey,
+          ...(opts.activeProject ? { project: opts.activeProject } : {}),
+        });
+        savePlan(plan, plan.projectPath);
+        sess.planAwaitingApproval = {
+          planId: plan.id,
+          chainId: plan.chainId,
+          proposedAt: Date.now(),
+        };
+        return {
+          handled: true,
+          response: this._formatPlanForApproval(plan, /* revised */ false),
+        };
+      } catch (err) {
+        logger.warn({ err, sessionKey: opts.sessionKey }, 'Plan mode: planRequest failed at entry');
+        // Fall through to normal chat. Better than blocking the owner.
+        return { handled: false };
+      }
+    }
+
+    // Not a plan-mode case — fall through to normal chat.
+    return { handled: false };
+  }
+
+  /** Format a plan for owner approval in chat. */
+  private _formatPlanForApproval(plan: import('../agent/bg-planner.js').Plan, revised: boolean): string {
+    const lines: string[] = [];
+    lines.push(revised
+      ? `**Revised plan (${plan.steps.length} steps)**`
+      : `**Here's how I'd do this (${plan.steps.length} steps)**`);
+    lines.push('');
+    for (const step of plan.steps) {
+      lines.push(`${step.index + 1}. **${step.title}**`);
+      if (step.scope) lines.push(`   ${step.scope}`);
+      if (step.deliverable) lines.push(`   → ${step.deliverable}`);
+    }
+    if (plan.notes) {
+      lines.push('');
+      lines.push(`_Notes_: ${plan.notes}`);
+    }
+    if (typeof plan.estimatedCostUsd === 'number') {
+      lines.push('');
+      lines.push(`Estimated cost: ~$${plan.estimatedCostUsd.toFixed(2)}`);
+    }
+    lines.push('');
+    lines.push('Say **yes / approve / go** to start, **cancel** to skip, or describe a revision (e.g., "swap step 3" or "add a verification step").');
+    return lines.join('\n');
   }
 
   // Offer-message formatter was removed in the Saturday-feel restoration —
@@ -2481,6 +2662,53 @@ export class Gateway {
           const { buildClementineTurnContext } = await import('../agent/clementine-turn-context.js');
           const { listBackgroundTasks } = await import('../agent/background-tasks.js');
           const { resolveProjectFromMessage } = await import('../agent/project-resolver.js');
+          const { classifyMessageShape } = await import('../agent/intent-classifier.js');
+
+          // 1.18.191 — classify message shape early. Simple messages
+          // get a lean turn-context block (no memory recall, no bg
+          // headlines, no dispute gate); multi-step messages keep
+          // the full block AND may trigger plan mode (below).
+          // Builder sessions skip — they have their own routing.
+          const shapeResult = !isBuilderSession
+            ? classifyMessageShape(originalText)
+            : { shape: 'simple' as const, score: 0, reasons: ['builder-session'] };
+          logger.debug({
+            sessionKey: effectiveSessionKey,
+            shape: shapeResult.shape,
+            score: shapeResult.score,
+            reasons: shapeResult.reasons,
+          }, 'Message shape classified');
+
+          // 1.18.191 — plan mode state machine.
+          //
+          // Two entry points for plan mode:
+          //
+          //   A. Approval-pending path. If the previous turn proposed a
+          //      plan, the user's message NOW is either approval,
+          //      revision, or cancel. Handle and return without
+          //      running normal chat.
+          //
+          //   B. Multi-step entry path. If shape='multi-step' AND no
+          //      pending plan, generate a plan, post it, set pending
+          //      state, return. The owner's NEXT message advances via
+          //      path A.
+          //
+          // Builder sessions skip both paths.
+          if (!isBuilderSession) {
+            const planMode = await this._maybeHandlePlanMode({
+              sessionKey: effectiveSessionKey,
+              userMessage: originalText,
+              shape: shapeResult.shape,
+              activeProject: this.getSessionProject(effectiveSessionKey) ?? null,
+              onText: wrappedOnText,
+            });
+            if (planMode.handled) {
+              clearTimeout(chatTimer);
+              if (hardWallTimer) clearTimeout(hardWallTimer);
+              { const cs = this.sessions.get(sessionKey); if (cs) delete cs.abortController; }
+              return planMode.response;
+            }
+          }
 
           // 1.18.187 — auto-resolve project from the user's message.
           // If a linked project's name/keyword matches with high
@@ -2596,6 +2824,10 @@ export class Gateway {
                 // 1.18.187 — pass active project so the turn-context block
                 // can include path / STATUS.md / inventory / deploy config.
                 activeProject: this.getSessionProject(effectiveSessionKey) ?? null,
+                // 1.18.191 — pass message shape so simple messages get the
+                // lean turn-context (skip memory recall, bg-task headlines,
+                // dispute gate). Token-optimization for routine chat.
+                messageShape: shapeResult.shape,
               });
               clementineContextBlock = turnCtx.block;
               logger.debug({

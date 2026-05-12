@@ -227,6 +227,208 @@ If there's relevant context from recent work or pending items, briefly mention i
   }
 }
 
+// ── Message shape: simple / multi-step / unknown (1.18.191) ──────────
+//
+// Orthogonal to the type axis above (question/task/feedback/casual/...).
+// The shape axis answers: "is this a single ask or a chain of work?"
+//
+// Used by:
+//   1. clementine-turn-context.ts — gate which sections inject for
+//      simple vs multi-step messages (token optimization). Simple
+//      messages get a much leaner per-turn block.
+//   2. router.ts — trigger plan-mode (planRequest + user approval +
+//      orchestrated chained execution) for multi-step requests BEFORE
+//      chat tries to do them all natively and overflows.
+//
+// Heuristic only — no LLM call. Runs on every chat turn so cost matters.
+
+export type MessageShape =
+  /** Single ask, single response. "what time is it", "remind me to call X". */
+  | 'simple'
+  /** Multiple distinct actions across phases. "send 25 emails after
+   *  scraping data from Salesforce and SEO sources, then summarize". */
+  | 'multi-step'
+  /** Ambiguous — falls through to today's full chat path (safe default). */
+  | 'unknown';
+
+export interface MessageShapeResult {
+  shape: MessageShape;
+  score: number;
+  reasons: string[];
+}
+
+/** Action verbs that strongly suggest "do work" rather than "answer". */
+const SHAPE_ACTION_VERBS = [
+  'send', 'create', 'build', 'generate', 'write', 'draft', 'compose',
+  'publish', 'deploy', 'upload', 'post', 'push',
+  'scrape', 'fetch', 'pull', 'extract', 'gather', 'collect',
+  'convert', 'merge', 'combine', 'transform', 'consolidate', 'aggregate',
+  'schedule', 'queue', 'run', 'execute', 'process',
+  'email', 'message', 'notify', 'alert', 'reply', 'forward',
+  'import', 'export', 'sync', 'backup',
+];
+
+const SHAPE_SEQUENCE_MARKERS: RegExp[] = [
+  /\band\s+then\b/i,
+  /\b(?:after|once|when)\s+(?:that|you|done|finished|complete)/i,
+  /\b(?:then|next|finally|last)\s*[,]?\s+\w+/i,
+  /\bfollowed\s+by\b/i,
+  /\b(?:step|phase)\s+\d+/i,
+];
+
+const SHAPE_BATCH_MARKERS: RegExp[] = [
+  /\b(?:for|on|to)\s+each\b/i,
+  /\b\d{2,}\s+\w+/, // "25 emails", "100 records"
+  /\beach\s+of\s+(?:them|the)\b/i,
+  /\b(?:all|every)\s+(?:of\s+)?(?:them|the\s+\w+)/i,
+  /\b(?:bulk|batch|mass)\b/i,
+];
+
+const SHAPE_NUMBERED_LIST = /\n\s*\d+[.)]\s+\w+/;
+
+const SHAPE_DOMAIN_MARKERS: RegExp[] = [
+  /\bsalesforce\b/i, /\bgmail\b/i, /\boutlook\b/i, /\bslack\b/i,
+  /\bdiscord\b/i, /\bnetlify\b/i, /\bvercel\b/i, /\bgithub\b/i,
+  /\bsupabase\b/i, /\bairtable\b/i, /\bhubspot\b/i, /\bnotion\b/i,
+  /\blinkedin\b/i, /\bcalendar\b/i, /\bdrive\b/i, /\bsheets\b/i,
+];
+
+/**
+ * Classify a chat message's structural shape (simple / multi-step).
+ *
+ * Scoring (sum of triggered signals):
+ *   - 2+ shape-action verbs: +1
+ *   - 3+ shape-action verbs: +2 cumulatively
+ *   - each sequence marker ("and then", "after that"): +1 (up to +2)
+ *   - batch marker ("for each", "25 emails"): +1
+ *   - numbered list: +2
+ *   - 2+ distinct integration domains in same message: +1
+ *   - length > 200 chars: +1
+ *   - length > 500 chars: +2 cumulatively
+ *
+ * Decision:
+ *   - score >= threshold (default 3) → 'multi-step'
+ *   - score === 0 AND <= 1 action verb AND length <= 200 → 'simple'
+ *   - otherwise → 'unknown' (today's chat path, no change)
+ */
+export function classifyMessageShape(
+  text: string,
+  opts: { threshold?: number } = {},
+): MessageShapeResult {
+  const reasons: string[] = [];
+  let score = 0;
+
+  if (!text || !text.trim()) {
+    return { shape: 'simple', score: 0, reasons: ['empty'] };
+  }
+
+  const trimmed = text.trim();
+  const lower = trimmed.toLowerCase();
+  const words = new Set(
+    lower.replace(/[^\w\s-]/g, ' ').split(/\s+/).filter(Boolean),
+  );
+
+  // Action verbs
+  const matchedVerbs: string[] = [];
+  for (const verb of SHAPE_ACTION_VERBS) {
+    if (words.has(verb)) matchedVerbs.push(verb);
+  }
+  if (matchedVerbs.length >= 2) {
+    score += 1;
+    reasons.push(`2+ action verbs (${matchedVerbs.slice(0, 4).join(', ')})`);
+  }
+  if (matchedVerbs.length >= 3) {
+    score += 1;
+    reasons.push('3+ action verbs');
+  }
+
+  // Sequence markers
+  for (const rx of SHAPE_SEQUENCE_MARKERS) {
+    const matches = lower.match(new RegExp(rx.source, 'gi'));
+    if (matches && matches.length > 0) {
+      score += Math.min(matches.length, 2);
+      reasons.push(`sequence marker: ${matches[0]}`);
+      break;
+    }
+  }
+
+  // Batch markers
+  for (const rx of SHAPE_BATCH_MARKERS) {
+    if (rx.test(trimmed)) {
+      score += 1;
+      reasons.push('batch marker (for each / N items / bulk)');
+      break;
+    }
+  }
+
+  // Numbered list
+  if (SHAPE_NUMBERED_LIST.test(trimmed)) {
+    score += 2;
+    reasons.push('numbered list');
+  }
+
+  // Cross-domain
+  let domainCount = 0;
+  for (const rx of SHAPE_DOMAIN_MARKERS) {
+    if (rx.test(trimmed)) domainCount += 1;
+  }
+  if (domainCount >= 2) {
+    score += 1;
+    reasons.push(`${domainCount} integration domains mentioned`);
+  }
+
+  // Length
+  if (trimmed.length > 200) {
+    score += 1;
+    reasons.push(`length > 200 (${trimmed.length})`);
+  }
+  if (trimmed.length > 500) {
+    score += 1;
+    reasons.push(`length > 500`);
+  }
+
+  // Decision
+  const threshold = opts.threshold ?? 3;
+  let shape: MessageShape;
+  if (score >= threshold) {
+    shape = 'multi-step';
+  } else if (score === 0 && matchedVerbs.length <= 1 && trimmed.length <= 200) {
+    shape = 'simple';
+  } else {
+    shape = 'unknown';
+  }
+
+  return { shape, score, reasons };
+}
+
+// ── Plan approval detection (1.18.191) ───────────────────────────────
+
+/**
+ * Detect whether the user's message is approving / revising / canceling
+ * a pending plan. Used by the chat-side plan-mode state machine when
+ * `sess.planAwaitingApproval` is set.
+ *
+ * Conservative: only short, clearly-affirmative messages qualify as
+ * approval. "yes but also do X" is NOT approval — it's a revision
+ * request and the state machine should re-plan with the feedback.
+ */
+export type PlanApprovalSignal = 'approve' | 'revise' | 'cancel' | 'other';
+
+const APPROVE_RE = /^(?:yes|y|yep|yeah|yup|sure|ok|okay|approve|approved|go|go ahead|run it|do it|sounds good|lgtm|ship it|👍|✅)[\s.!]*$/i;
+const CANCEL_RE = /^(?:cancel|stop|nvm|nevermind|never\s*mind|forget it|don['']?t|abort|kill it)\b/i;
+const REVISE_RE = /\b(?:but|except|instead|change|modify|add(?:\s+also)?|remove|skip|swap|wait|actually|hold on)\b/i;
+
+export function detectPlanApproval(message: string): PlanApprovalSignal {
+  if (!message) return 'other';
+  const text = message.trim();
+  if (!text) return 'other';
+
+  if (CANCEL_RE.test(text)) return 'cancel';
+  if (text.length <= 30 && APPROVE_RE.test(text)) return 'approve';
+  if (text.length > 30 || REVISE_RE.test(text)) return 'revise';
+  return 'other';
+}
+
 /**
  * Generate a follow-up suggestion prompt suffix based on completed work.
  *

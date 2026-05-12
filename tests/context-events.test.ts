@@ -47,7 +47,12 @@ describe('context event ledger', () => {
 
     expect(second.id).toBe(first.id);
     expect(second.count).toBe(2);
-    expect(listContextEvents(sessionKey, { baseDir })).toHaveLength(1);
+    // 1.18.191 — pin `now` to an eventAt-relative time so the
+    // listContextEvents 7-day window doesn't time out as real-world
+    // dates drift past the hardcoded eventAt above.
+    expect(
+      listContextEvents(sessionKey, { baseDir, now: Date.parse('2026-05-05T13:00:00.000Z') }),
+    ).toHaveLength(1);
   });
 
   it('tracks surfaced and acknowledged state independent of turn text', () => {
