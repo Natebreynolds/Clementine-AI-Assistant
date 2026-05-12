@@ -103,6 +103,7 @@ type PendingBackgroundOffer = {
   sessionKey: string;
   fromAgent: string;
   prompt: string;
+  taskPrompt: string;
   recommendation: ComplexTaskRecommendation;
   createdAt: number;
   expiresAt: number;
@@ -161,6 +162,16 @@ export function buildContextOverflowRetryPrompt(opts: {
   }
   parts.push(opts.chatPrompt);
   return parts.filter(Boolean).join('\n\n');
+}
+
+export function runAgentResultIndicatesContextOverflow(result: { subtype?: string; terminalReason?: string; text?: string }): boolean {
+  const terminalReason = (result.terminalReason ?? '').trim();
+  if (terminalReason && classifyChatError(terminalReason) === 'context_overflow') return true;
+  const subtype = (result.subtype ?? '').trim();
+  if (subtype && subtype !== 'success' && classifyChatError(subtype) === 'context_overflow') return true;
+  const text = (result.text ?? '').trim();
+  return /^Autocompact is thrashing:\s*the context refilled to the limit/i.test(text)
+    || /^rapid_refill_breaker\b/i.test(text);
 }
 
 export type ChatErrorKind = 'rate_limit' | 'one_million_context' | 'context_overflow' | 'auth' | 'billing' | 'transient' | 'unknown';
@@ -401,6 +412,19 @@ export class Gateway {
     return this._agentSlugFromSessionKey(sessionKey) ?? this.getSessionProfile(sessionKey) ?? 'clementine';
   }
 
+  private buildBackgroundTaskPrompt(sessionKey: string, prompt: string): string {
+    const sess = this.sessions.get(sessionKey);
+    const parts = [
+      '[Background task from chat: run this in a fresh task execution. Do not rely on the live chat transcript being resumed; use the self-contained request below.]',
+    ];
+    if (sess?.project?.path) {
+      const description = sess.project.description ? ` (${sess.project.description})` : '';
+      parts.push(`[Active project: ${sess.project.path}${description}]`);
+    }
+    parts.push(prompt.trim());
+    return parts.filter(Boolean).join('\n\n');
+  }
+
   private pruneExpiredBackgroundOffers(): void {
     const now = Date.now();
     for (const [id, offer] of this.pendingBackgroundOffers) {
@@ -434,6 +458,7 @@ export class Gateway {
       sessionKey,
       fromAgent: this.backgroundAgentForSession(sessionKey),
       prompt,
+      taskPrompt: this.buildBackgroundTaskPrompt(sessionKey, prompt),
       recommendation,
       createdAt: Date.now(),
       expiresAt: Date.now() + 30 * 60_000,
@@ -445,7 +470,7 @@ export class Gateway {
   private queueBackgroundOffer(offer: PendingBackgroundOffer): BackgroundTask {
     const task = createBackgroundTask({
       fromAgent: offer.fromAgent,
-      prompt: offer.prompt,
+      prompt: offer.taskPrompt,
       maxMinutes: offer.recommendation.suggestedMaxMinutes,
       sessionKey: offer.sessionKey,
     });
@@ -464,26 +489,39 @@ export class Gateway {
     return [
       `Queued background task **${task.id}**.`,
       '',
-      `It will run as **${task.fromAgent}** with a ${task.maxMinutes} minute cap.`,
+      `It will run as **${task.fromAgent}** in a fresh task session with a ${task.maxMinutes} minute cap.`,
       `Use \`status ${task.id}\` or check the dashboard Background Tasks panel for progress.`,
     ].join('\n');
   }
 
-  private formatBackgroundOfferResponse(offer: PendingBackgroundOffer): string {
-    const lines = [
-      'This looks like long-running, multi-tool work. I recommend running it in the background so chat does not go stale.',
-      '',
-      '**Plan**',
-      ...offer.recommendation.plan.map((step, idx) => `${idx + 1}. ${step}`),
-      '',
-      `**Why background:** ${offer.recommendation.reasons.join('; ')}.`,
-      `**Estimated cap:** ${offer.recommendation.suggestedMaxMinutes} minutes.`,
-      `**Background offer:** ${offer.id}`,
-      '',
-      `Reply \`run background ${offer.id}\` to queue it, \`run inline ${offer.id}\` to run it in this chat, or \`save skill ${offer.id}\` to make it reusable first.`,
-    ];
-    return lines.join('\n');
+  private queueBackgroundTaskAfterContextOverflow(sessionKey: string, prompt: string): { task: BackgroundTask; response: string } {
+    const recommendation = detectComplexTaskForBackground(prompt);
+    const task = createBackgroundTask({
+      fromAgent: this.backgroundAgentForSession(sessionKey),
+      prompt,
+      maxMinutes: recommendation?.suggestedMaxMinutes ?? 60,
+      sessionKey,
+    });
+    logger.warn({
+      taskId: task.id,
+      sessionKey,
+      fromAgent: task.fromAgent,
+      maxMinutes: task.maxMinutes,
+    }, 'Queued background task after repeated chat context overflow');
+    return {
+      task,
+      response: [
+        `The live chat context hit the limit, so I moved this into background task **${task.id}** and kept your request attached.`,
+        '',
+        `It will run as **${task.fromAgent}** in a fresh task session with a ${task.maxMinutes} minute cap.`,
+        `Use \`status ${task.id}\` or check the dashboard Background Tasks panel for progress.`,
+      ].join('\n'),
+    };
   }
+
+  // Offer-message formatter was removed in the Saturday-feel restoration —
+  // the chat path no longer asks "want me to run this in the background?".
+  // Auto-queue on explicit user intent is silent; everything else just runs.
 
   public acceptBackgroundOffer(sessionKey: string, id: string): { ok: boolean; response: string; task?: BackgroundTask } {
     const offer = this.getBackgroundOfferForSession(sessionKey, id);
@@ -2211,39 +2249,35 @@ export class Gateway {
           || text.startsWith('[Reaction:')
           || text.startsWith('[System:');
 
+        // ── Explicit background-intent shortcut ────────────────────────
+        // Chat normally runs in-place — the SDK auto-compacts and the model
+        // can spawn `planner` / `researcher` subagents for context-heavy
+        // sub-steps, just like Claude Code. We only auto-queue a durable
+        // background task when the user *explicitly* says "in the
+        // background", "overnight", "keep working", "don't stop", etc. The
+        // post-overflow rescue path below still catches the rare case
+        // where chat actually drowns despite all that.
         if (!skipBackgroundOffer && !isBuilderSession && !isInternalMsg && this.isTrustedPersonalSession(sessionKey)) {
           const recommendation = detectComplexTaskForBackground(text);
           if (recommendation) {
             const offer = this.createBackgroundOffer(sessionKey, text, recommendation);
-            if (recommendation.queueImmediately) {
-              const task = this.queueBackgroundOffer(offer);
-              const queued = this.formatBackgroundQueuedResponse(task);
-              if (ledgerRunMetadata) {
-                ledgerRunMetadata.executionMode = 'background_queued';
-                ledgerRunMetadata.backgroundTaskId = task.id;
-              }
-              if (onText) {
-                try { await onText(queued); } catch { /* channel streaming is best-effort */ }
-              }
-              this.mirrorChatExchange(sessionKey, originalText, queued, { model: 'chat-control' });
-              return queued;
-            }
-            const offerText = this.formatBackgroundOfferResponse(offer);
+            const task = this.queueBackgroundOffer(offer);
+            const queued = this.formatBackgroundQueuedResponse(task);
             if (ledgerRunMetadata) {
-              ledgerRunMetadata.executionMode = 'background_offer';
+              ledgerRunMetadata.executionMode = 'background_queued';
+              ledgerRunMetadata.backgroundTaskId = task.id;
             }
             logger.info({
               sessionKey,
-              offerId: offer.id,
-              score: recommendation.score,
+              taskId: task.id,
               reasons: recommendation.reasons,
               maxMinutes: recommendation.suggestedMaxMinutes,
-            }, 'Offering background execution for complex chat request');
+            }, 'Auto-queued background task on explicit user intent');
             if (onText) {
-              try { await onText(offerText); } catch { /* channel streaming is best-effort */ }
+              try { await onText(queued); } catch { /* channel streaming is best-effort */ }
             }
-            this.mirrorChatExchange(sessionKey, originalText, offerText, { model: 'chat-control' });
-            return offerText;
+            this.mirrorChatExchange(sessionKey, originalText, queued, { model: 'chat-control' });
+            return queued;
           }
         }
 
@@ -2371,6 +2405,8 @@ export class Gateway {
           // Interrupt flag was set but no useful partial text — just clear it.
           delete sessState.pendingInterrupt;
         }
+
+        let contextOverflowRecoveryPrompt = '';
 
         try {
           // ── Canonical SDK chat path (Phase 5) ────────────────────────
@@ -2502,21 +2538,17 @@ export class Gateway {
             abortSignal: chatAc.signal,
           });
 
-          let runAgentResult;
-          try {
-            runAgentResult = await runAgent(finalPrompt, buildRunAgentChatOptions({
-              ...(priorSdkSessionId ? { resumeSessionId: priorSdkSessionId } : {}),
-              ...(chatSystemAppend ? { systemPromptAppend: chatSystemAppend } : {}),
-            }));
-          } catch (err) {
-            if (chatAc.signal.aborted || classifyChatError(err) !== 'context_overflow') {
-              throw err;
-            }
+          let didContextOverflowRetry = false;
+          const contextOverflowAfterRetryError = () => new Error('rapid_refill_breaker after context overflow retry');
+          const retryAfterContextOverflow = async () => {
+            if (didContextOverflowRetry) throw contextOverflowAfterRetryError();
+            didContextOverflowRetry = true;
             const retryPrompt = buildContextOverflowRetryPrompt({
               chatPrompt,
               turnContextPrefix,
               project: sess?.project ?? null,
             });
+            contextOverflowRecoveryPrompt = retryPrompt;
             logger.info({
               sessionKey: effectiveSessionKey,
               hadResume: !!priorSdkSessionId,
@@ -2529,9 +2561,50 @@ export class Gateway {
               await onProgress('refreshing conversation context...').catch(() => { /* non-fatal */ });
             }
             this.assistant.clearSession(effectiveSessionKey);
-            runAgentResult = await runAgent(retryPrompt, buildRunAgentChatOptions({
+            return runAgent(retryPrompt, buildRunAgentChatOptions({
               ...(retrySystemAppend ? { systemPromptAppend: retrySystemAppend } : {}),
             }));
+          };
+
+          let runAgentResult;
+          try {
+            runAgentResult = await runAgent(finalPrompt, buildRunAgentChatOptions({
+              ...(priorSdkSessionId ? { resumeSessionId: priorSdkSessionId } : {}),
+              ...(chatSystemAppend ? { systemPromptAppend: chatSystemAppend } : {}),
+            }));
+          } catch (err) {
+            if (chatAc.signal.aborted || classifyChatError(err) !== 'context_overflow') {
+              throw err;
+            }
+            runAgentResult = await retryAfterContextOverflow();
+          }
+
+          if (!chatAc.signal.aborted && runAgentResultIndicatesContextOverflow(runAgentResult)) {
+            if (didContextOverflowRetry) {
+              logger.info({
+                sessionKey: effectiveSessionKey,
+                subtype: runAgentResult.subtype,
+                terminalReason: runAgentResult.terminalReason,
+                textPreview: runAgentResult.text?.slice(0, 240),
+              }, 'Context overflow result after retry — queueing background task');
+              throw contextOverflowAfterRetryError();
+            }
+            logger.info({
+              sessionKey: effectiveSessionKey,
+              subtype: runAgentResult.subtype,
+              terminalReason: runAgentResult.terminalReason,
+              textPreview: runAgentResult.text?.slice(0, 240),
+            }, 'Context overflow result — retrying current message in fresh SDK session');
+            runAgentResult = await retryAfterContextOverflow();
+            if (runAgentResultIndicatesContextOverflow(runAgentResult)) {
+              logger.info({
+                sessionKey: effectiveSessionKey,
+                subtype: runAgentResult.subtype,
+                terminalReason: runAgentResult.terminalReason,
+                textPreview: runAgentResult.text?.slice(0, 240),
+              }, 'Context overflow result after retry — queueing background task');
+              throw contextOverflowAfterRetryError();
+            }
           }
 
           if (ledgerRunMetadata) {
@@ -2612,9 +2685,18 @@ export class Gateway {
               this.clearSession(effectiveSessionKey);
               return oneMillionContextRecoveryMessage();
             case 'context_overflow':
-              logger.info({ sessionKey }, 'Context overflow — rotating session');
+              logger.info({ sessionKey }, 'Context overflow after retry — queueing background task');
               this.assistant.clearSession(effectiveSessionKey);
-              return "That conversation got too long — I've started a fresh session. Please resend your message.";
+              {
+                const promptForBackground = contextOverflowRecoveryPrompt || chatPrompt;
+                const { response, task } = this.queueBackgroundTaskAfterContextOverflow(sessionKey, promptForBackground);
+                if (ledgerRunMetadata) {
+                  ledgerRunMetadata.executionMode = 'background_queued';
+                  ledgerRunMetadata.backgroundTaskId = task.id;
+                }
+                this.mirrorChatExchange(sessionKey, originalText, response, { model: 'chat-control' });
+                return response;
+              }
             case 'auth':
               this.recordAuthFailure();
               return "I'm temporarily offline due to an authentication issue. The owner needs to re-authenticate — I'll recover automatically once it's resolved.";

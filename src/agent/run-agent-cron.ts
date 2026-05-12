@@ -18,6 +18,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
+import type { AgentDefinition } from '@anthropic-ai/claude-agent-sdk';
 import {
   BASE_DIR,
   VAULT_DIR,
@@ -38,6 +39,32 @@ const CRON_PROGRESS_NOTES_MAX_CHARS = 2000;
 const logger = pino({ name: 'clementine.run-agent-cron' });
 
 const CRON_CONTEXT_ITEM_MAX = 80;
+const CLEMENTINE_TOOLS_SERVER = `${(process.env.ASSISTANT_NAME ?? 'Clementine').toLowerCase()}-tools`;
+const BACKGROUND_TASK_WORKER_NAME = 'background-task-worker';
+const DEFAULT_BACKGROUND_WORKER_TOOLS = [
+  'Agent',
+  'Read',
+  'Write',
+  'Edit',
+  'Glob',
+  'Grep',
+  'Bash',
+  'WebSearch',
+  'WebFetch',
+  'TodoWrite',
+];
+
+const BACKGROUND_TASK_WORKER_PROMPT = [
+  'You are Clementine\'s background task worker for long-running user requests.',
+  '',
+  'Run the assigned task to completion using the available tools. Keep raw API responses, scraped pages, and large file contents out of the final answer; extract the fields you need and continue.',
+  '',
+  'Use TodoWrite for multi-step state. Process batch work in bounded chunks, checkpoint meaningful progress in durable artifacts when useful, and avoid repeating the same expensive read or tool call.',
+  '',
+  'If credentials, missing scope, human approval, or an irreversible action blocks completion, stop with one concise blocker/question and the exact next action needed. Do not keep retrying blindly.',
+  '',
+  'Return only the final user-facing result: links or changed locations, counts, skipped/error records, and the next recommended action.',
+].join('\n');
 
 /** Total number of skill blocks injected into a cron prompt — pinned + auto. */
 const MAX_INJECTED_SKILLS = 4;
@@ -190,6 +217,28 @@ function capContextItem(s: string): string {
 function capContextBlock(s: string, max: number): string {
   if (!s) return '';
   return s.length <= max ? s : s.slice(0, max - 3) + '...';
+}
+
+function backgroundWorkerTools(effectiveAllowedTools: string[] | undefined, mcpServersApplied: string[]): string[] {
+  if (effectiveAllowedTools) return [...new Set(['Agent', ...effectiveAllowedTools])];
+  const mcpWildcards = [CLEMENTINE_TOOLS_SERVER, ...mcpServersApplied]
+    .filter(Boolean)
+    .map((server) => `mcp__${server}__*`);
+  return [...new Set([...DEFAULT_BACKGROUND_WORKER_TOOLS, ...mcpWildcards])];
+}
+
+function buildBackgroundTaskWorker(tools: string[], model?: string, maxTurns?: number): AgentDefinition {
+  return {
+    description: [
+      'Use for background tasks queued from chat, especially multi-step work, batch data collection, project builds, deployments, and external-system writebacks.',
+      'This agent owns the heavy tool loop so the parent task context stays small.',
+    ].join(' '),
+    prompt: BACKGROUND_TASK_WORKER_PROMPT,
+    tools,
+    ...(model ? { model } : { model: 'sonnet' }),
+    effort: 'medium',
+    maxTurns: typeof maxTurns === 'number' && maxTurns > 0 ? maxTurns : 40,
+  };
 }
 
 /**
@@ -963,11 +1012,19 @@ export async function runAgentCron(opts: RunAgentCronOptions): Promise<RunAgentC
     skillsMissing: plan.skillsMissing.length,
     trickAllowedTools: effectiveAllowedTools?.length,
     trickAllowedMcp: opts.allowedMcpServers?.length,
+    forcedBackgroundWorker: opts.jobName.startsWith('bg:'),
     widenedFromSkills: plan.widenedFromSkills,
     ...(promptOversized ? { warning: 'prompt > 50KB; risk of "Prompt is too long" failure' } : {}),
   }, 'runAgentCron: dispatching to runAgent');
 
   const startedAt = Date.now();
+  const forceBackgroundWorker = opts.jobName.startsWith('bg:');
+  const workerTools = forceBackgroundWorker
+    ? backgroundWorkerTools(effectiveAllowedTools, mcpServersApplied)
+    : [];
+  const workerDef = forceBackgroundWorker
+    ? buildBackgroundTaskWorker(workerTools, opts.model, opts.maxTurns)
+    : null;
   const result = await runAgent(builtPrompt, {
     sessionKey: `cron:${opts.jobName}`,
     source: 'cron',
@@ -977,9 +1034,16 @@ export async function runAgentCron(opts: RunAgentCronOptions): Promise<RunAgentC
     model: opts.model,
     effort,
     ...(maxBudget !== undefined ? { maxBudgetUsd: maxBudget } : {}),
-    maxTurns: opts.maxTurns,
+    maxTurns: forceBackgroundWorker ? 5 : opts.maxTurns,
     abortSignal: opts.abortSignal,
-    ...(effectiveAllowedTools ? { allowedTools: effectiveAllowedTools } : {}),
+    ...(forceBackgroundWorker
+      ? {
+          allowedTools: ['Agent'],
+          permissionTools: workerTools,
+          forceSubagent: BACKGROUND_TASK_WORKER_NAME,
+          agents: { [BACKGROUND_TASK_WORKER_NAME]: workerDef! },
+        }
+      : (effectiveAllowedTools ? { allowedTools: effectiveAllowedTools } : {})),
     extraMcpServers: mcpServerMap as unknown as Parameters<typeof runAgent>[1]['extraMcpServers'],
     // 1.18.121 — pipe the merged addDirs+pinned-skill folders to the SDK
     // so a skill's bundled scripts/templates are reachable via Bash/Read

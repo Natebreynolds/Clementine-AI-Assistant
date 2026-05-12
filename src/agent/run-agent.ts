@@ -21,7 +21,7 @@ import { randomUUID } from 'node:crypto';
 import { query, type AgentDefinition, type SDKAssistantMessage, type SDKResultMessage, type SessionStore } from '@anthropic-ai/claude-agent-sdk';
 import pino from 'pino';
 import { EventLog } from '../gateway/event-log.js';
-import type { RunEvent } from '../types.js';
+import type { RunEvent, TerminalReason } from '../types.js';
 
 /**
  * Module-level cache of MCP server statuses from the most recent SDK
@@ -74,6 +74,16 @@ function truncateForLog(value: unknown, maxBytes: number): unknown {
   } catch {
     return { _unstringifiable: true };
   }
+}
+
+/** True when the SDK emits an internal context-pressure diagnostic as an
+ * assistant text block. These are operational warnings, not useful user
+ * output, and they can appear while the run is still recovering/continuing. */
+export function isSdkContextDiagnosticText(text: string): boolean {
+  const t = text.trim();
+  if (!t) return false;
+  return /^Autocompact is thrashing:\s*the context refilled to the limit/i.test(t)
+    || /^rapid_refill_breaker\b/i.test(t);
 }
 
 /** Drop one server from the cache so the next query repopulates it. */
@@ -287,6 +297,9 @@ export interface RunAgentResult {
 
   /** Final stop reason from the SDK (success, error_max_turns, error_max_budget_usd, etc). */
   subtype: string;
+
+  /** Precise SDK loop terminal reason, when available. */
+  terminalReason?: TerminalReason;
 
   /** Token usage breakdown (input, output, cache). */
   usage?: {
@@ -660,6 +673,7 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
   let totalCostUsd = 0;
   let numTurns = 0;
   let subtype = 'unknown';
+  let terminalReason: TerminalReason | undefined;
   let usage: RunAgentResult['usage'];
 
   const stream = query({ prompt: effectivePrompt, options: sdkOptions });
@@ -715,6 +729,15 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
       const blocks = (am.message?.content ?? []) as Array<{ type: string; text?: string; name?: string; input?: Record<string, unknown>; id?: string; thinking?: string }>;
       for (const block of blocks) {
         if (block.type === 'text' && typeof block.text === 'string') {
+          if (isSdkContextDiagnosticText(block.text)) {
+            logger.warn({
+              sessionKey: opts.sessionKey,
+              source,
+              subtype,
+              preview: block.text.slice(0, 240),
+            }, 'runAgent: suppressed SDK context diagnostic text');
+            continue;
+          }
           finalText += block.text;
           // PRD Phase 4a / 1.18.85: llm_text Event. Truncate at 8KB to keep
           // the JSONL light — full text is reachable via the SDK transcript.
@@ -783,6 +806,7 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
       const result = message as SDKResultMessage;
       sessionId = sessionId || (result.session_id ?? '');
       subtype = result.subtype ?? 'unknown';
+      terminalReason = (result as { terminal_reason?: TerminalReason }).terminal_reason;
       numTurns = (result as { num_turns?: number }).num_turns ?? numTurns;
       totalCostUsd = (result as { total_cost_usd?: number }).total_cost_usd ?? 0;
       const u = (result as { usage?: RunAgentResult['usage'] }).usage;
@@ -801,7 +825,7 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
         ts: new Date().toISOString(),
         sessionId,
         costUsd: totalCostUsd,
-        stopReason: subtype,
+        stopReason: terminalReason && terminalReason !== 'completed' ? `${subtype}:${terminalReason}` : subtype,
       });
       // PRD Phase 4d / 1.18.101: unregister from the hook-session registry.
       // Late-arriving hook events for this sessionId silently drop after this.
@@ -933,6 +957,7 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
     numTurns,
     sessionId,
     subtype,
+    ...(terminalReason ? { terminalReason } : {}),
     ...(usage ? { usage } : {}),
     runId,
     permissionMode: toolPolicy.permissionMode,

@@ -1,41 +1,46 @@
+/**
+ * Explicit background-intent detector.
+ *
+ * Returns a recommendation ONLY when the user explicitly asks for background
+ * / autonomous / overnight execution. We deliberately do not classify "this
+ * looks complex" anymore — chat now stays in the live SDK loop, with
+ * automatic compaction and inline subagent delegation (Agent → planner /
+ * researcher / etc.) for context isolation, just like Claude Code itself.
+ * Big work that genuinely blows past the SDK's auto-compact is caught by the
+ * gateway's overflow → retry → promote-to-background fallback, which is the
+ * *real* escape hatch instead of a regex pre-classifier.
+ *
+ * The narrow detection here is what lets a user say "go research this
+ * overnight" and have it actually queue as a durable background task.
+ */
 export interface ComplexTaskRecommendation {
-  score: number;
   reasons: string[];
   suggestedMaxMinutes: number;
   plan: string[];
-  queueImmediately: boolean;
+  /** Always true when this function returns a recommendation — the only
+   *  trigger is the user explicitly asking for background execution. Kept
+   *  on the type for back-compat with the post-overflow rescue path. */
+  queueImmediately: true;
 }
 
+// Skill authoring is an interactive build-with-the-user flow; never auto-queue.
 const SKILL_AUTHORING_RE = /\b(create|make|build|draft|write|teach|save|update)\b.{0,40}\b(skill|SKILL\.md)\b|\bskill[- ]creator\b/i;
-const EXPLICIT_BACKGROUND_RE = /\b(background|deep mode|keep working|don't stop|dont stop|autonomous|long[- ]running|run overnight|take your time)\b/i;
-const COMPLEX_WORK_RE = /\b(audit|research|analy[sz]e|review|scrape|crawl|extract|enrich|compile|compare|verify|cross[- ]check|triage|reconcile|draft|generate|update|sync|report back|write back)\b/i;
-const BATCH_RE = /\b(all|every|each|bulk|batch|list of|contacts?|leads?|accounts?|tasks?|tickets?|records?|rows?|pages?|repos?|projects?)\b/i;
-const SIDE_EFFECT_RE = /\b(update|write|create|draft|send|post|comment|reply|upload|append|sync|mark|close|move)\b/i;
-const MULTI_STEP_RE = /\b(and then|then|after that|finally|from .* to |against .* and |across|compile .* into|check .* then)\b/i;
+
+// The ONLY trigger. Matches "in the background", "overnight", "keep working",
+// "don't stop", "autonomous", "long-running", "take your time", "deep mode".
+const EXPLICIT_BACKGROUND_RE = /\b(background|deep mode|keep working|don't stop|dont stop|autonomous|long[- ]running|run overnight|overnight|take your time)\b/i;
+
+// Light scope hints used only for the duration estimate + plan text. None of
+// these alter whether the function fires — they shape the recommendation
+// once the explicit-intent gate has already opened.
+const BATCH_RE = /\b(all|every|each|bulk|batch|list of|contacts?|leads?|accounts?|tasks?|tickets?|records?|rows?|pages?|repos?|projects?|firms?|metros?|prospects?)\b/i;
+const SIDE_EFFECT_RE = /\b(update|write|create|draft|send|post|comment|reply|upload|append|sync|mark|close|move|deploy|host|publish)\b/i;
 
 const SYSTEM_KEYWORDS = [
-  'asana',
-  'salesforce',
-  'google sheet',
-  'google sheets',
-  'sheet',
-  'sheets',
-  'dataforseo',
-  'hubspot',
-  'notion',
-  'github',
-  'gmail',
-  'outlook',
-  'slack',
-  'discord',
-  'website',
-  'websites',
-  'crm',
-  'spreadsheet',
-  'csv',
-  'airtable',
-  'linear',
-  'jira',
+  'asana', 'salesforce', 'google sheet', 'google sheets', 'sheet', 'sheets',
+  'dataforseo', 'hubspot', 'notion', 'github', 'gmail', 'outlook', 'slack',
+  'discord', 'website', 'websites', 'crm', 'spreadsheet', 'csv', 'netlify',
+  'vercel', 'airtable', 'linear', 'jira',
 ];
 
 function countSystemMentions(text: string): number {
@@ -47,9 +52,9 @@ function countSystemMentions(text: string): number {
   return count;
 }
 
-function estimatedMinutes(score: number, systemCount: number): number {
-  if (score >= 8 || systemCount >= 4) return 90;
-  if (score >= 6 || systemCount >= 3) return 60;
+function estimatedMinutes(systemCount: number, textLength: number): number {
+  if (systemCount >= 4 || textLength > 800) return 90;
+  if (systemCount >= 2 || textLength > 400) return 60;
   return 30;
 }
 
@@ -79,49 +84,16 @@ export function detectComplexTaskForBackground(text: string): ComplexTaskRecomme
   const trimmed = text.trim();
   if (!trimmed) return null;
   if (SKILL_AUTHORING_RE.test(trimmed)) return null;
+  if (!EXPLICIT_BACKGROUND_RE.test(trimmed)) return null;
 
   const systemCount = countSystemMentions(trimmed);
-  const reasons: string[] = [];
-  let score = 0;
-
-  if (EXPLICIT_BACKGROUND_RE.test(trimmed)) {
-    score += 4;
-    reasons.push('explicit background/deep-work wording');
-  }
-  if (COMPLEX_WORK_RE.test(trimmed)) {
-    score += 2;
-    reasons.push('multi-step work verb');
-  }
-  if (BATCH_RE.test(trimmed)) {
-    score += 2;
-    reasons.push('batch or many-record scope');
-  }
-  if (SIDE_EFFECT_RE.test(trimmed)) {
-    score += 1;
-    reasons.push('write/draft/update side effects');
-  }
-  if (MULTI_STEP_RE.test(trimmed)) {
-    score += 1;
-    reasons.push('multi-step sequencing');
-  }
-  if (systemCount >= 2) {
-    score += Math.min(4, systemCount);
-    reasons.push(`${systemCount} named systems or data surfaces`);
-  }
-  if (trimmed.length > 450) {
-    score += 1;
-    reasons.push('long detailed request');
-  }
-
-  const queueImmediately = EXPLICIT_BACKGROUND_RE.test(trimmed) && score >= 5;
-  const shouldOffer = queueImmediately || score >= 5 || (systemCount >= 2 && (BATCH_RE.test(trimmed) || SIDE_EFFECT_RE.test(trimmed)));
-  if (!shouldOffer) return null;
+  const reasons: string[] = ['explicit background/deep-work wording'];
+  if (systemCount >= 2) reasons.push(`${systemCount} named systems`);
 
   return {
-    score,
     reasons,
-    suggestedMaxMinutes: estimatedMinutes(score, systemCount),
+    suggestedMaxMinutes: estimatedMinutes(systemCount, trimmed.length),
     plan: buildPlan(trimmed, systemCount),
-    queueImmediately,
+    queueImmediately: true,
   };
 }
