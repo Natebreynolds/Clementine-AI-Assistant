@@ -62,6 +62,29 @@ describe('buildAgentMap — system subagents', () => {
     expect(researcher.effort).toBe('low');
   });
 
+  it('researcher does NOT have a tools allowlist — inherits parent surface (1.18.198)', () => {
+    // Before 1.18.198 researcher had a hardcoded allowlist that excluded
+    // every MCP server. When Ross dispatched "Parallel SEO enrichment for
+    // 13 domains" the subagent couldn't call mcp__dataforseo__* and fell
+    // back to "I cannot do this" — Ross then ran 25 sequential MCP calls
+    // in his own turn instead. The fix: omit `tools` so the subagent
+    // inherits parent's full tool surface. Safety lives in the prompt.
+    const { researcher } = buildAgentMap();
+    expect(researcher.tools).toBeUndefined();
+  });
+
+  it('researcher prompt enforces read-only behavior as a behavior class, not allowlist', () => {
+    const { researcher } = buildAgentMap();
+    const prompt = researcher.prompt ?? '';
+    // Must call out read-only.
+    expect(prompt.toLowerCase()).toContain('read-only');
+    // Must name the mutation-keyword regex so the model can self-police
+    // against ANY MCP server (not just ones we know about).
+    expect(prompt).toMatch(/send_|create_|update_|delete_/);
+    // Must tell researcher it inherits from parent.
+    expect(prompt.toLowerCase()).toMatch(/inherit|every tool the parent/);
+  });
+
   it('cron-fixer has the canonical broken-job tools, not a generic surface', () => {
     const { 'cron-fixer': fixer } = buildAgentMap();
     expect(fixer.tools).toContain('mcp__clementine-tools__list_broken_jobs');

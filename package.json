@@ -1,6 +1,6 @@
 {
   "name": "clementine-agent",
-  "version": "1.18.197",
+  "version": "1.18.198",
   "description": "Clementine — Personal AI Assistant (TypeScript)",
   "type": "module",
   "main": "dist/index.js",

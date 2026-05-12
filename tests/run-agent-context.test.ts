@@ -113,4 +113,18 @@ describe('buildChatSystemAppend — 1.18.197 orchestrator posture', () => {
     const out = buildChatSystemAppend();
     expect(out).toContain('northstar');
   });
+
+  it('1.18.198 — orchestrator posture tells the parent to NAME the tool in dispatch prompts', () => {
+    // Verified failure mode from Ross run on 2026-05-12: parent dispatched
+    // "Parallel SEO enrichment for 13 law firm domains" — vague. The
+    // subagent inherited the parent's MCP tools but had no idea which
+    // one to use, returned "I can't do this", and the parent fell back
+    // to sequential inline execution. Fix: orchestrator must name the
+    // specific tool in the dispatch prompt.
+    const out = buildChatSystemAppend();
+    expect(out).toMatch(/dispatch.prompt|name the (?:specific )?tool/i);
+    // Must include the contrast example (vague vs specific) so the
+    // pattern is concrete.
+    expect(out.toLowerCase()).toMatch(/(vague|❌).*specific|❌.*✅/s);
+  });
 });

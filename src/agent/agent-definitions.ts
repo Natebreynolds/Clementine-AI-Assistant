@@ -58,11 +58,26 @@ const PLANNER_PROMPT = [
 ].join('\n');
 
 const RESEARCHER_PROMPT = [
-  'You are a per-item research specialist. You receive ONE specific item to investigate (one lead, one account, one file, one topic).',
+  'You are a per-item research specialist. You receive ONE specific item to investigate (one lead, one account, one domain, one file, one topic).',
   '',
-  'Use your bounded tools to gather the requested information. Return a ONE-PARAGRAPH summary in the format the parent specified.',
+  '## Tool access (1.18.198)',
   '',
-  'NEVER return raw tool output, full lists, or unbounded data. If a tool returns 50KB of JSON, extract only the fields you need and discard the rest.',
+  'You INHERIT every tool the parent agent has access to: Bash, Read, Grep, Glob, WebSearch, WebFetch, AND every MCP tool the parent has wired (dataforseo, brightdata, Salesforce, Gmail, Composio integrations, etc.). If the parent has it, you have it.',
+  '',
+  'The parent\'s dispatch prompt names the SPECIFIC tool you should use. Use exactly that tool. If the prompt is vague ("enrich this domain"), pick the most appropriate read-only tool from your inherited surface and proceed.',
+  '',
+  '## Safety bounds (behavior, not allowlist)',
+  '',
+  'You are READ-ONLY. Never call:',
+  '- `Edit`, `Write`, `NotebookEdit` (mutate files)',
+  '- Any MCP tool whose name contains `send_`, `create_`, `update_`, `delete_`, `post_`, `apply_`, `move_`, `rename_`, `archive_`, `set_`, `add_`, `remove_`, `enable_`, `disable_`, `subscribe_`, `unsubscribe_`, `assign_`, `cancel_`, `approve_`',
+  '- Bash commands containing `rm `, `mv `, `>>`, `>` (except for piping to `head`/`awk`), `git commit`, `git push`, `sf data ... update`, `sf data ... delete`, or any shell side-effect',
+  '',
+  'If you cannot complete the request read-only, say so in one line — do not improvise a mutation.',
+  '',
+  '## Output discipline',
+  '',
+  'Return a ONE-PARAGRAPH summary in the format the parent specified. Never raw tool output, never full lists, never unbounded data dumps. If a tool returns 50KB of JSON, extract only the requested fields and discard the rest — your job is to compress.',
   '',
   'If you cannot find the requested data, say so in one line. Do not speculate.',
 ].join('\n');
@@ -200,18 +215,36 @@ export function buildAgentMap(opts: BuildAgentMapOptions = {}): Record<string, A
   };
 
   // Researcher: haiku, per-item investigation. Cheap fan-out target.
-  // No Bash — researcher is read-only fanout, must not mutate state.
+  //
+  // 1.18.198 — NO `tools` allowlist. Researcher inherits every tool the
+  // parent has access to (Bash, Read, MCP wildcards, etc.). The earlier
+  // hardcoded ['Read', 'Grep', 'Glob', 'WebSearch', 'WebFetch'] blocked
+  // researcher from using the parent's MCP servers — when Ross dispatched
+  // "Parallel SEO enrichment for 13 domains" the subagent couldn't call
+  // `mcp__dataforseo__*` because it wasn't in the allowlist. Result: the
+  // subagent said "I can't do that" and Ross fell back to running 25
+  // sequential MCP calls in his own turn, defeating the fan-out.
+  //
+  // Read-only behavior is enforced in RESEARCHER_PROMPT (behavior class:
+  // no `Edit`/`Write`, no MCP tools containing send_/create_/update_/
+  // delete_/etc.). The prompt is the contract; the SDK lets the subagent
+  // inherit everything from the parent.
   map['researcher'] = {
     description: [
       'Use this subagent to investigate ONE specific item — a single',
-      'lead, account, file, web page, or topic — and return a',
+      'lead, account, domain, file, web page, or topic — and return a',
       'one-paragraph summary. Spawn it in PARALLEL via the Agent tool',
-      'with one subagent per item when the planner returns multiple',
-      'research steps. Read-only: never mutates state. Cheap (Haiku).',
+      'with one subagent per item for batch fan-out. Read-only: never',
+      'mutates state (Haiku, inherits parent tool surface).',
+      '',
+      'When dispatching, NAME THE SPECIFIC TOOL in the prompt (e.g.',
+      '"call mcp__dataforseo__google_domain_rank_overview for domain X")',
+      'rather than describing the goal abstractly ("enrich this domain").',
     ].join(' '),
     prompt: RESEARCHER_PROMPT,
     model: 'haiku',
-    tools: ['Read', 'Grep', 'Glob', 'WebSearch', 'WebFetch'],
+    // NO `tools` field — inherit from parent. See RESEARCHER_PROMPT for
+    // read-only safety enforcement.
     effort: 'low',
     maxTurns: 15,
   };

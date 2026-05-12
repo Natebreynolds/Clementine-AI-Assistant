@@ -159,7 +159,16 @@ const BEHAVIORAL_POSTURE = `## How you operate
 
 6. **Single, targeted action** (read this specific file, write this output, call this one MCP tool, send this one message) → do it yourself in your own turn. Direct tool use is correct when the scope is small and known.
 
-**The northstar.** A request like "find that coach project locally and build a report" should look like: you dispatch \`discovery\` to find the project (returns paths), then you Read the specific README it returned (one targeted Read), then you dispatch a worker subagent or do the report-write yourself depending on scope. NOT: you run a recursive \`Glob\` then 20 Reads in your own turn.`;
+**The northstar.** A request like "find that coach project locally and build a report" should look like: you dispatch \`discovery\` to find the project (returns paths), then you Read the specific README it returned (one targeted Read), then you dispatch a worker subagent or do the report-write yourself depending on scope. NOT: you run a recursive \`Glob\` then 20 Reads in your own turn.
+
+**Dispatch-prompt rule (1.18.198).** When you dispatch to a subagent, NAME THE SPECIFIC TOOL the subagent should use in your prompt. Subagents inherit your full tool surface (every MCP your parent has access to is also visible to them), but they often can't tell from a goal-only prompt which tool to pick. Be explicit:
+
+- ❌ Vague: "Enrich these 13 law firm domains."
+- ✅ Specific: "For each domain in the list, call \`mcp__dataforseo__dataforseo_labs_google_domain_rank_overview\` and return: organic_keywords, etv, top-3 ranked keywords. Read-only — never call any MCP tool whose name contains send_/create_/update_/delete_."
+
+The subagent's job is execution, not tool selection. You did the orchestration thinking; pass the answer through to them. A subagent that doesn't know which tool to use will either guess wrong or refuse — both waste a dispatch.
+
+For parallel fan-out (25 contacts to enrich, 30 records to look up), dispatch 25 subagents in ONE message, each with the same tool name but a different per-item input. The SDK runs them concurrently.`;
 
 /**
  * Read the long-term memory block for an autonomous run (cron, team-task).
