@@ -107,6 +107,7 @@ import { buildGuardHooks, type ToolOutputGuardConfig } from './tool-output-guard
 import { buildDedupHook } from './tool-call-dedup.js';
 import { buildSideEffectIdempotencyHook } from './side-effect-idempotency.js';
 import { buildChatStopHook } from './chat-stop-hook.js';
+import { buildRunStateHooks } from './run-state.js';
 import type { AgentProfile } from '../types.js';
 import type { AgentManager } from './agent-manager.js';
 import type { MemoryStore } from '../memory/store.js';
@@ -644,6 +645,14 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
     },
   });
 
+  // ── Live RunState hook (1.18.202) ─────────────────────────────────
+  // Hook-fed active-run state for Stop decisions. Durable history remains
+  // EventLog; this cache exists only while a run is active.
+  const runState = buildRunStateHooks({
+    runId,
+    sessionKey: opts.sessionKey,
+  });
+
   // ── Chat persistence Stop hook (1.18.184, source='chat' only) ─────
   // Keeps chat-initiated multi-step jobs running until they finish.
   // Inspects the model's last assistant message for continuation
@@ -659,6 +668,7 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
     ? buildChatStopHook({
         runId,
         ...(opts.abortSignal ? { abortSignal: opts.abortSignal } : {}),
+        runState: runState.state,
         onDecision: (info) => {
           if (info.decision !== 'continue') return;
           writeEvent({
@@ -676,6 +686,10 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
   // HookCallbackMatcher per event; we concatenate.
   const mergedHooks: typeof guard.hooks = { ...guard.hooks };
   for (const [evt, matchers] of Object.entries(idempotency.hooks) as Array<[keyof typeof idempotency.hooks, NonNullable<typeof idempotency.hooks[keyof typeof idempotency.hooks]>]>) {
+    const existing = mergedHooks[evt] ?? [];
+    mergedHooks[evt] = [...existing, ...matchers];
+  }
+  for (const [evt, matchers] of Object.entries(runState.hooks) as Array<[keyof typeof runState.hooks, NonNullable<typeof runState.hooks[keyof typeof runState.hooks]>]>) {
     const existing = mergedHooks[evt] ?? [];
     mergedHooks[evt] = [...existing, ...matchers];
   }
@@ -1038,6 +1052,13 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
       blocked: idempotency.stats.blocked,
       recorded: idempotency.stats.recorded,
       failedNotRecorded: idempotency.stats.failedNotRecorded,
+    } : undefined,
+    runState: runState.stats.inspected > 0 ? {
+      inspected: runState.stats.inspected,
+      sideEffects: runState.stats.sideEffects,
+      todosUpdated: runState.stats.todosUpdated,
+      successfulSideEffects: runState.state.successfulSideEffects.length,
+      failedSideEffects: runState.state.failedSideEffects.length,
     } : undefined,
   }, 'runAgent: query complete');
 

@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { buildChatStopHook } from '../src/agent/chat-stop-hook.js';
+import { buildRunStateHooks } from '../src/agent/run-state.js';
 import type { StopHookInput } from '@anthropic-ai/claude-agent-sdk';
 
 const FAKE_SIGNAL: AbortSignal = new AbortController().signal;
@@ -141,6 +142,74 @@ describe('buildChatStopHook — guards', () => {
     expect(result.decision).toBeUndefined();
     expect(stats.passed).toBe(1);
     expect(stats.continued).toBe(0);
+  });
+});
+
+describe('buildChatStopHook — live RunState enforcement', () => {
+  it('re-prompts when TodoWrite still has unfinished items', async () => {
+    const runState = buildRunStateHooks({ runId: 'r10' }).state;
+    runState.todo = { total: 3, completed: 1, inProgress: 1, pending: 1 };
+    const { hooks, stats } = buildChatStopHook({ runId: 'r10', runState });
+    const cb = hooks.Stop![0].hooks[0];
+    const result = await cb(
+      makeStopEvt({ last_assistant_message: 'I made progress.' }),
+      'tu_unused',
+      FAKE_SIGNAL,
+    ) as { decision?: string; reason?: string };
+
+    expect(result.decision).toBe('block');
+    expect(result.reason).toContain('unfinished item');
+    expect(stats.todoContinued).toBe(1);
+  });
+
+  it('requires a Completed/Pending manifest after successful side effects', async () => {
+    const runState = buildRunStateHooks({ runId: 'r11' }).state;
+    runState.successfulSideEffects.push({
+      toolName: 'mcp__outlook__OUTLOOK_SEND_EMAIL',
+      toolUseId: 'send-1',
+      summary: 'email send to kevin@example.com ("Hi")',
+      kind: 'side_effect',
+      successful: true,
+      successReason: 'status-2xx',
+      statusCode: 202,
+      ts: '2026-05-12T21:00:00.000Z',
+    });
+    const { hooks, stats } = buildChatStopHook({ runId: 'r11', runState });
+    const cb = hooks.Stop![0].hooks[0];
+    const result = await cb(
+      makeStopEvt({ last_assistant_message: 'Done.' }),
+      'tu_unused',
+      FAKE_SIGNAL,
+    ) as { decision?: string; reason?: string };
+
+    expect(result.decision).toBe('block');
+    expect(result.reason).toContain('✅ **Completed**');
+    expect(result.reason).toContain('kevin@example.com');
+    expect(stats.manifestRequired).toBe(1);
+  });
+
+  it('passes when successful side effects are acknowledged with the manifest header', async () => {
+    const runState = buildRunStateHooks({ runId: 'r12' }).state;
+    runState.successfulSideEffects.push({
+      toolName: 'mcp__outlook__OUTLOOK_SEND_EMAIL',
+      summary: 'email send to kevin@example.com ("Hi")',
+      kind: 'side_effect',
+      successful: true,
+      ts: '2026-05-12T21:00:00.000Z',
+    });
+    const { hooks, stats } = buildChatStopHook({ runId: 'r12', runState });
+    const cb = hooks.Stop![0].hooks[0];
+    const result = await cb(
+      makeStopEvt({
+        last_assistant_message: '✅ **Completed**\n- Outlook sends: 1 accepted\n\n⚠️ **Pending**\n- None',
+      }),
+      'tu_unused',
+      FAKE_SIGNAL,
+    ) as { decision?: string };
+
+    expect(result.decision).toBeUndefined();
+    expect(stats.passed).toBe(1);
+    expect(stats.manifestRequired).toBe(0);
   });
 });
 

@@ -48,6 +48,8 @@ import type {
   HookJSONOutput,
   StopHookInput,
 } from '@anthropic-ai/claude-agent-sdk';
+import type { LiveRunState } from './run-state.js';
+import { hasCompletedManifest, summarizeRunStateForManifest } from './run-state.js';
 
 const logger = pino({ name: 'clementine.chat-stop-hook' });
 
@@ -80,6 +82,9 @@ export interface StopHookOptions {
   /** Optional abort signal to honor — if it fires, the hook will
    *  never re-block. User-initiated stops always win. */
   abortSignal?: AbortSignal;
+  /** Live hook-fed run state. When present, Stop can require a final
+   *  Completed/Pending manifest after external side effects. */
+  runState?: LiveRunState;
   /** Optional callback fired on every decision. Useful for the
    *  dashboard "What Clementine sees this turn" panel. */
   onDecision?: (info: {
@@ -97,6 +102,10 @@ export interface StopHookStats {
   passed: number;
   /** Stop events where we re-prompted the model to continue. */
   continued: number;
+  /** Stop events blocked because live RunState showed unfinished todos. */
+  todoContinued: number;
+  /** Stop events blocked because side effects were not acknowledged. */
+  manifestRequired: number;
 }
 
 export interface StopHookHandles {
@@ -110,7 +119,7 @@ export interface StopHookHandles {
  * Build a Stop hook for a chat-initiated agentic run.
  */
 export function buildChatStopHook(opts: StopHookOptions): StopHookHandles {
-  const stats: StopHookStats = { inspected: 0, passed: 0, continued: 0 };
+  const stats: StopHookStats = { inspected: 0, passed: 0, continued: 0, todoContinued: 0, manifestRequired: 0 };
 
   const stopHook: HookCallback = async (input) => {
     if (input.hook_event_name !== 'Stop') return {} as HookJSONOutput;
@@ -157,6 +166,55 @@ export function buildChatStopHook(opts: StopHookOptions): StopHookHandles {
         stopHookActive: false,
       });
       return {} as HookJSONOutput;
+    }
+
+    const unfinishedTodos = opts.runState?.todo
+      ? opts.runState.todo.pending + opts.runState.todo.inProgress
+      : 0;
+    if (unfinishedTodos > 0) {
+      stats.todoContinued += 1;
+      const reason =
+        `TodoWrite still shows ${unfinishedTodos} unfinished item(s). ` +
+        'Keep working until the todo list is complete, or explain the blocker and include a concise Completed/Pending manifest before ending.';
+      logger.info({
+        runId: opts.runId,
+        unfinishedTodos,
+        lastMessagePreview,
+      }, 'Stop hook re-prompting model because live RunState has unfinished todos');
+      opts.onDecision?.({
+        decision: 'continue',
+        reason,
+        lastMessagePreview,
+        stopHookActive: false,
+      });
+      return {
+        decision: 'block' as const,
+        reason,
+      } as HookJSONOutput;
+    }
+
+    const successfulSideEffects = opts.runState?.successfulSideEffects.length ?? 0;
+    if (successfulSideEffects > 0 && !hasCompletedManifest(lastMsg)) {
+      stats.manifestRequired += 1;
+      const reason =
+        `You completed ${successfulSideEffects} external side effect(s), but your final message does not include the required ` +
+        '`✅ **Completed**` manifest. Confirm what was done before ending.\n\n' +
+        summarizeRunStateForManifest(opts.runState!);
+      logger.info({
+        runId: opts.runId,
+        successfulSideEffects,
+        lastMessagePreview,
+      }, 'Stop hook requiring completion manifest for successful side effects');
+      opts.onDecision?.({
+        decision: 'continue',
+        reason,
+        lastMessagePreview,
+        stopHookActive: false,
+      });
+      return {
+        decision: 'block' as const,
+        reason,
+      } as HookJSONOutput;
     }
 
     // ── Detection: did the model say it would continue? ──────────
