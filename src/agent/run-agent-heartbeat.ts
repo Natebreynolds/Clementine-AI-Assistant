@@ -1,8 +1,7 @@
 /**
  * Clementine TypeScript — runAgent heartbeat wrapper.
  *
- * Phase 4 of the SDK-canonical migration (see
- * /Users/nathan.reynolds/.claude/plans/sdk-canonical-migration.md).
+ * Phase 4 of the SDK-canonical migration.
  *
  * Heartbeats are tool-free decision-makers. They look at standing
  * instructions, what changed, and the time of day, and decide whether
@@ -34,6 +33,7 @@ function formatTime(d: Date): string {
 import type { AgentProfile } from '../types.js';
 import type { MemoryStore } from '../memory/store.js';
 import { runAgent, type RunAgentResult } from './run-agent.js';
+import { defaultPermissionModeForLane } from './execution-policy.js';
 
 const logger = pino({ name: 'clementine.run-agent-heartbeat' });
 
@@ -106,6 +106,10 @@ export async function runAgentHeartbeat(opts: RunAgentHeartbeatOptions): Promise
   const result = await runAgent(prompt, {
     sessionKey,
     source: 'heartbeat',
+    // Explicit lane policy — heartbeat is decision-only and fires up
+    // to 28x/day per agent. Pinned strict-allowlist mode so the lane
+    // can't silently widen via default-default drift.
+    permissionMode: defaultPermissionModeForLane('heartbeat'),
     profile: opts.profile,
     memoryStore: opts.memoryStore,
     model: opts.model ?? MODELS.haiku,

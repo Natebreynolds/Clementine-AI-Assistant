@@ -39,8 +39,8 @@ function resolveRunAgentBudget(
 }
 
 describe('runAgent budget resolution (1.18.188 — DEFAULT_BUDGETS yields when all-zero)', () => {
-  // The exact scenario from Zach's 2026-05-12 failure: BUDGET_*_USD=0
-  // everywhere, but a chat-overflow handoff fires the bg task as
+  // Regression case: BUDGET_*_USD=0 everywhere, but a chat-overflow
+  // handoff fires the bg task as
   // source='cron' which hit the $1.00 DEFAULT_BUDGETS.cron fallback.
   // 1.18.188 makes this fallback yield to "all-zero" intent.
   const DEFAULTS = { cron: 1.0, heartbeat: 0.25, 'team-task': 1.0, test: 2.0 };

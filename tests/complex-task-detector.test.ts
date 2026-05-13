@@ -2,15 +2,27 @@ import { describe, expect, it } from 'vitest';
 import { detectComplexTaskForBackground } from '../src/agent/complex-task-detector.js';
 
 describe('complex task background detector', () => {
-  it('returns null for multi-system batch work without explicit background intent', () => {
-    // Chat now handles this directly with auto-compaction + planner/researcher
-    // subagent delegation. Only an explicit "in the background / overnight"
-    // phrasing should auto-queue.
+  it('queues obvious multi-system batch work without requiring magic background wording', () => {
     const rec = detectComplexTaskForBackground(
       'Review all of my Asana tasks, compile the updates into Google Sheets, check Salesforce and four websites, then update Asana and report back.',
     );
 
-    expect(rec).toBeNull();
+    expect(rec).toBeTruthy();
+    expect(rec?.queueImmediately).toBe(true);
+    expect(rec?.reasons.join(' ')).toMatch(/named systems/);
+  });
+
+  it('queues large research-to-sheet-to-email workflows without explicit background wording', () => {
+    const rec = detectComplexTaskForBackground(
+      'Research 100 businesses, drop the data in a Google Sheet, and then draft emails in Outlook when all is said and done.',
+    );
+
+    expect(rec).toBeTruthy();
+    expect(rec?.queueImmediately).toBe(true);
+    expect(rec?.suggestedMaxMinutes).toBe(90);
+    expect(rec?.reasons).toContain('large batch (100 items)');
+    expect(rec?.reasons.join(' ')).toMatch(/research\/enrichment plus write or draft side effects/);
+    expect(rec?.plan[0]).toMatch(/discovery preflight/);
   });
 
   it('queues immediately when the user explicitly asks for background work', () => {
@@ -43,9 +55,18 @@ describe('complex task background detector', () => {
   });
 
   it('returns null for project build and deployment requests without explicit background intent', () => {
-    // The "host on Netlify" canonical test case: chat should just do it.
+    // Single project build/deploy requests should stay interactive unless
+    // the user asks for sustained work or the job later overflows.
     const rec = detectComplexTaskForBackground(
-      'Please recreate the dashboard as part of the coaches project and then host it on Netlify.',
+      'Please recreate the dashboard as part of the catalog project and then host it on Netlify.',
+    );
+
+    expect(rec).toBeNull();
+  });
+
+  it('does not mistake unrelated numbers like years for batch counts', () => {
+    const rec = detectComplexTaskForBackground(
+      'Research companies founded after 2024 and tell me the trend.',
     );
 
     expect(rec).toBeNull();

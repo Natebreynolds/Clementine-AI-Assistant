@@ -15,8 +15,8 @@ describe('migration 0004 — backfill schemaVersion', () => {
     vaultDir = path.join(tmpRoot, 'vault');
     baseDir = tmpRoot;
     pkgDir = '/dev/null/pkg'; // not used in this migration
-    mkdirSync(path.join(vaultDir, '00-System', 'agents', 'ross-the-sdr'), { recursive: true });
-    mkdirSync(path.join(vaultDir, '00-System', 'agents', 'sasha-the-cmo'), { recursive: true });
+    mkdirSync(path.join(vaultDir, '00-System', 'agents', 'sales-agent'), { recursive: true });
+    mkdirSync(path.join(vaultDir, '00-System', 'agents', 'marketing-agent'), { recursive: true });
   });
 
   afterEach(() => {
@@ -43,18 +43,18 @@ describe('migration 0004 — backfill schemaVersion', () => {
   });
 
   it('adds schemaVersion to all agent.md files', async () => {
-    writeFileSync(path.join(vaultDir, '00-System', 'agents', 'ross-the-sdr', 'agent.md'), '---\nname: Ross\ntier: 1\n---\n\nbody\n');
-    writeFileSync(path.join(vaultDir, '00-System', 'agents', 'sasha-the-cmo', 'agent.md'), '---\nname: Sasha\ntier: 2\n---\n\nbody\n');
+    writeFileSync(path.join(vaultDir, '00-System', 'agents', 'sales-agent', 'agent.md'), '---\nname: Alex\ntier: 1\n---\n\nbody\n');
+    writeFileSync(path.join(vaultDir, '00-System', 'agents', 'marketing-agent', 'agent.md'), '---\nname: Morgan\ntier: 2\n---\n\nbody\n');
 
     const result = await migration.apply({ vaultDir, baseDir, pkgDir });
     expect((result as { applied: boolean }).applied).toBe(true);
 
-    const ross = matter(readFileSync(path.join(vaultDir, '00-System', 'agents', 'ross-the-sdr', 'agent.md'), 'utf-8'));
-    const sasha = matter(readFileSync(path.join(vaultDir, '00-System', 'agents', 'sasha-the-cmo', 'agent.md'), 'utf-8'));
-    expect(ross.data.schemaVersion).toBe(1);
-    expect(sasha.data.schemaVersion).toBe(1);
-    expect(ross.data.name).toBe('Ross');
-    expect(sasha.data.tier).toBe(2);
+    const alex = matter(readFileSync(path.join(vaultDir, '00-System', 'agents', 'sales-agent', 'agent.md'), 'utf-8'));
+    const morgan = matter(readFileSync(path.join(vaultDir, '00-System', 'agents', 'marketing-agent', 'agent.md'), 'utf-8'));
+    expect(alex.data.schemaVersion).toBe(1);
+    expect(morgan.data.schemaVersion).toBe(1);
+    expect(alex.data.name).toBe('Alex');
+    expect(morgan.data.tier).toBe(2);
   });
 
   it('is idempotent — second run is a no-op', async () => {

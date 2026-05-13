@@ -28,8 +28,8 @@ describe('planRequest', () => {
   it('produces a valid Plan from a clean JSON response', async () => {
     const fakeLlm = async () => JSON.stringify({
       steps: [
-        { title: 'Find the coaches project', scope: 'Run project_discover, link the match', expectedTools: ['project_discover', 'project_link'], deliverable: 'project linked' },
-        { title: 'Read source data', scope: 'Bash head/awk on the CSV', expectedTools: ['Bash'], deliverable: '/path/to/sources/coaches.csv summarized' },
+        { title: 'Find the catalog project', scope: 'Run project_discover, link the match', expectedTools: ['project_discover', 'project_link'], deliverable: 'project linked' },
+        { title: 'Read source data', scope: 'Bash head/awk on the CSV', expectedTools: ['Bash'], deliverable: '/path/to/sources/catalog.csv summarized' },
         { title: 'Build HTML', scope: 'Write output/index.html', expectedTools: ['Write'], deliverable: 'output/index.html' },
         { title: 'Deploy', scope: 'project_deploy', expectedTools: ['project_deploy'], deliverable: 'https://x.netlify.app' },
         { title: 'Verify', scope: 'curl the URL, expect 200', expectedTools: ['Bash'], deliverable: 'HTTP 200 confirmation' },
@@ -39,19 +39,19 @@ describe('planRequest', () => {
     });
 
     const plan = await planRequest({
-      userRequest: 'build me an HTML report for coaches and deploy',
+      userRequest: 'build me an HTML report for catalog and deploy',
       llmCall: fakeLlm,
     });
 
     expect(plan.steps).toHaveLength(5);
-    expect(plan.steps[0]?.title).toBe('Find the coaches project');
+    expect(plan.steps[0]?.title).toBe('Find the catalog project');
     expect(plan.steps[0]?.expectedTools).toContain('project_discover');
     expect(plan.steps[0]?.status).toBe('pending');
     expect(plan.steps[0]?.index).toBe(0);
     expect(plan.steps[4]?.index).toBe(4);
     expect(plan.estimatedCostUsd).toBe(0.45);
     expect(plan.notes).toContain('linked');
-    expect(plan.userRequest).toBe('build me an HTML report for coaches and deploy');
+    expect(plan.userRequest).toBe('build me an HTML report for catalog and deploy');
     expect(plan.chainId).toMatch(/^chain-/);
     expect(plan.id).toMatch(/^plan-/);
     expect(plan.status).toBe('pending');
@@ -91,16 +91,16 @@ describe('planRequest', () => {
       });
     };
     await planRequest({
-      userRequest: 'continue work on coaches',
+      userRequest: 'continue work on catalog',
       project: {
-        path: '/Users/me/Projects/coaches',
-        description: '100 coaches migration',
-        keywords: ['coaches'],
+        path: '/Users/me/Projects/catalog',
+        description: '100 product records migration',
+        keywords: ['catalog'],
       },
       llmCall: fakeLlm,
     });
-    expect(capturedUserPrompt).toContain('/Users/me/Projects/coaches');
-    expect(capturedUserPrompt).toContain('100 coaches migration');
+    expect(capturedUserPrompt).toContain('/Users/me/Projects/catalog');
+    expect(capturedUserPrompt).toContain('100 product records migration');
   });
 
   it('preserves originatingSessionKey on the Plan', async () => {

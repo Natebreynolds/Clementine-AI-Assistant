@@ -23,12 +23,12 @@ import type { NotificationContext } from '../src/types.js';
 
 describe('inferAgentSlugFromSessionKey', () => {
   it('extracts slug from heartbeat:<slug>', () => {
-    expect(inferAgentSlugFromSessionKey('heartbeat:ross-the-sdr')).toBe('ross-the-sdr');
-    expect(inferAgentSlugFromSessionKey('heartbeat:sasha-the-cmo')).toBe('sasha-the-cmo');
+    expect(inferAgentSlugFromSessionKey('heartbeat:sales-agent')).toBe('sales-agent');
+    expect(inferAgentSlugFromSessionKey('heartbeat:marketing-agent')).toBe('marketing-agent');
   });
 
   it('extracts slug from agent-heartbeat:<slug>', () => {
-    expect(inferAgentSlugFromSessionKey('agent-heartbeat:nora-senior-sdr')).toBe('nora-senior-sdr');
+    expect(inferAgentSlugFromSessionKey('agent-heartbeat:research-agent')).toBe('research-agent');
   });
 
   it('treats heartbeat:clementine as Clementine-owned (no inference)', () => {
@@ -37,30 +37,30 @@ describe('inferAgentSlugFromSessionKey', () => {
   });
 
   it('extracts the receiving slug from team-task:<from>-><to>', () => {
-    expect(inferAgentSlugFromSessionKey('team-task:clementine->ross-the-sdr')).toBe('ross-the-sdr');
-    expect(inferAgentSlugFromSessionKey('team-task:sasha-the-cmo->ross-the-sdr')).toBe('ross-the-sdr');
+    expect(inferAgentSlugFromSessionKey('team-task:clementine->sales-agent')).toBe('sales-agent');
+    expect(inferAgentSlugFromSessionKey('team-task:marketing-agent->sales-agent')).toBe('sales-agent');
   });
 
   it('returns undefined when the receiving slug is clementine', () => {
-    expect(inferAgentSlugFromSessionKey('team-task:ross-the-sdr->clementine')).toBeUndefined();
+    expect(inferAgentSlugFromSessionKey('team-task:sales-agent->clementine')).toBeUndefined();
   });
 
   it('extracts slug from discord:agent:<slug>:<userId>', () => {
-    expect(inferAgentSlugFromSessionKey('discord:agent:ross-the-sdr:1234567890')).toBe('ross-the-sdr');
+    expect(inferAgentSlugFromSessionKey('discord:agent:sales-agent:1234567890')).toBe('sales-agent');
   });
 
   it('extracts slug from discord:member-dm:<slug>:<userId>', () => {
-    expect(inferAgentSlugFromSessionKey('discord:member-dm:sasha-the-cmo:9999')).toBe('sasha-the-cmo');
+    expect(inferAgentSlugFromSessionKey('discord:member-dm:marketing-agent:9999')).toBe('marketing-agent');
   });
 
   it('extracts slug from discord:member:<channelId>:<slug>:<userId>', () => {
-    expect(inferAgentSlugFromSessionKey('discord:member:111222:nora-senior-sdr:333444')).toBe('nora-senior-sdr');
+    expect(inferAgentSlugFromSessionKey('discord:member:111222:research-agent:333444')).toBe('research-agent');
   });
 
   it('returns undefined for cron sessionKeys (cron threads agentSlug explicitly)', () => {
     // The cron path always passes agentSlug via dispatchContextForJob;
     // the dispatcher must not try to mine the job name as a slug.
-    expect(inferAgentSlugFromSessionKey('cron:ross-the-sdr:reply-detection')).toBeUndefined();
+    expect(inferAgentSlugFromSessionKey('cron:sales-agent:reply-detection')).toBeUndefined();
     expect(inferAgentSlugFromSessionKey('cron:morning-briefing')).toBeUndefined();
   });
 
@@ -91,28 +91,28 @@ describe('NotificationDispatcher routing', () => {
   });
 
   it('threads explicit context.agentSlug through to the channel sender', async () => {
-    await dispatcher.send('hello', { agentSlug: 'ross-the-sdr', sessionKey: 'cron:ross-the-sdr:reply-detection' });
+    await dispatcher.send('hello', { agentSlug: 'sales-agent', sessionKey: 'cron:sales-agent:reply-detection' });
     expect(received).toHaveLength(1);
-    expect(received[0].context?.agentSlug).toBe('ross-the-sdr');
+    expect(received[0].context?.agentSlug).toBe('sales-agent');
   });
 
   it('infers agentSlug from heartbeat sessionKey when caller omitted it', async () => {
-    await dispatcher.send('hello', { sessionKey: 'heartbeat:ross-the-sdr' });
-    expect(received[0].context?.agentSlug).toBe('ross-the-sdr');
+    await dispatcher.send('hello', { sessionKey: 'heartbeat:sales-agent' });
+    expect(received[0].context?.agentSlug).toBe('sales-agent');
   });
 
   it('infers agentSlug from team-task sessionKey when caller omitted it', async () => {
-    await dispatcher.send('hello', { sessionKey: 'team-task:clementine->sasha-the-cmo' });
-    expect(received[0].context?.agentSlug).toBe('sasha-the-cmo');
+    await dispatcher.send('hello', { sessionKey: 'team-task:clementine->marketing-agent' });
+    expect(received[0].context?.agentSlug).toBe('marketing-agent');
   });
 
   it('explicit context.agentSlug wins over an inferable one', async () => {
-    // sessionKey points at Sasha but caller explicitly set Ross — Ross wins.
+    // sessionKey points at one agent but caller explicitly set another — caller wins.
     await dispatcher.send('hello', {
-      agentSlug: 'ross-the-sdr',
-      sessionKey: 'heartbeat:sasha-the-cmo',
+      agentSlug: 'sales-agent',
+      sessionKey: 'heartbeat:marketing-agent',
     });
-    expect(received[0].context?.agentSlug).toBe('ross-the-sdr');
+    expect(received[0].context?.agentSlug).toBe('sales-agent');
   });
 
   it('leaves agentSlug undefined for Clementine-owned sessions', async () => {

@@ -34,7 +34,7 @@ function makeBgTasks(...tasks: Array<Partial<BackgroundTask> & { status: Backgro
 describe('shape=simple: lean turn-context (1.18.191)', () => {
   it('skips memory recall section', () => {
     const memStore = makeMemStore([
-      { section: 'MEMORY.md', content: 'Nathan likes coffee' },
+      { section: 'MEMORY.md', content: 'Owner likes coffee' },
     ]);
     const result = buildClementineTurnContext({
       userMessage: 'what time is it',
@@ -45,7 +45,7 @@ describe('shape=simple: lean turn-context (1.18.191)', () => {
     });
     expect(result.sections.retrievedMemory).toBe(0);
     expect(result.block).not.toContain('Possibly relevant from persistent memory');
-    expect(result.block).not.toContain('Nathan likes coffee');
+    expect(result.block).not.toContain('Owner likes coffee');
     // searchContext should NOT have been called.
     expect(memStore.searchContext).not.toHaveBeenCalled();
   });
@@ -85,13 +85,13 @@ describe('shape=simple: lean turn-context (1.18.191)', () => {
       userMessage: 'hi',
       sessionKey: 'discord:dm:owner',
       channel: 'discord-dm',
-      ownerName: 'Nathan',
+      ownerName: 'Owner',
       messageShape: 'simple',
       now: NOW,
     });
     expect(result.sections.identityFrame).toBe(true);
     expect(result.sections.liveState).toBe(true);
-    expect(result.block).toContain('Nathan');
+    expect(result.block).toContain('Owner');
     expect(result.block).toContain('Current time');
   });
 
@@ -115,9 +115,9 @@ describe('shape=simple: lean turn-context (1.18.191)', () => {
 
   it('block is meaningfully smaller than multi-step block for the same memory store', () => {
     const memStore = makeMemStore([
-      { section: 'MEMORY.md', content: 'Nathan likes coffee. He is a Max user.' },
+      { section: 'MEMORY.md', content: 'Owner likes coffee. He is a Max user.' },
       { section: 'people/jordan', content: 'Jordan is the dev lead at Co X' },
-      { section: 'projects/coaches', content: 'Track coaches migration project' },
+      { section: 'projects/catalog', content: 'Track catalog migration project' },
     ]);
     const simpleResult = buildClementineTurnContext({
       userMessage: 'hi',

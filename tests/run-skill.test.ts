@@ -24,10 +24,10 @@ function fakeSkill(overrides: Partial<Skill> = {}): Skill {
 describe('applyMustache', () => {
   it('substitutes simple {{var}} placeholders', () => {
     const out = applyMustache('Hello {{name}}, you have {{count}} messages.', {
-      name: 'Nathan',
+      name: 'Owner',
       count: 3,
     });
-    expect(out).toBe('Hello Nathan, you have 3 messages.');
+    expect(out).toBe('Hello Owner, you have 3 messages.');
   });
 
   it('handles whitespace inside the braces', () => {

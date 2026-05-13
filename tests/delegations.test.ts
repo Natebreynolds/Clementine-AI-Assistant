@@ -33,7 +33,7 @@ afterEach(() => {
 
 describe('Delegation CRUD', () => {
   it('creates a delegation file in the target agent directory', () => {
-    const toAgent = 'ross';
+    const toAgent = 'alex';
     const delDir = path.join(AGENTS_BASE, toAgent, 'delegations');
     mkdirSync(delDir, { recursive: true });
 
@@ -58,14 +58,14 @@ describe('Delegation CRUD', () => {
 
   it('readAllDelegations scans all agent delegation directories', () => {
     // Create delegations for two agents
-    const rossDir = path.join(AGENTS_BASE, 'ross', 'delegations');
-    const sashaDir = path.join(AGENTS_BASE, 'sasha', 'delegations');
+    const rossDir = path.join(AGENTS_BASE, 'alex', 'delegations');
+    const sashaDir = path.join(AGENTS_BASE, 'morgan', 'delegations');
     mkdirSync(rossDir, { recursive: true });
     mkdirSync(sashaDir, { recursive: true });
 
-    writeFileSync(path.join(rossDir, 'a.json'), JSON.stringify({ id: 'a', toAgent: 'ross', fromAgent: 'clementine', task: 'Task A', status: 'pending' }));
-    writeFileSync(path.join(rossDir, 'b.json'), JSON.stringify({ id: 'b', toAgent: 'ross', fromAgent: 'sasha', task: 'Task B', status: 'completed' }));
-    writeFileSync(path.join(sashaDir, 'c.json'), JSON.stringify({ id: 'c', toAgent: 'sasha', fromAgent: 'clementine', task: 'Task C', status: 'in_progress' }));
+    writeFileSync(path.join(rossDir, 'a.json'), JSON.stringify({ id: 'a', toAgent: 'alex', fromAgent: 'clementine', task: 'Task A', status: 'pending' }));
+    writeFileSync(path.join(rossDir, 'b.json'), JSON.stringify({ id: 'b', toAgent: 'alex', fromAgent: 'morgan', task: 'Task B', status: 'completed' }));
+    writeFileSync(path.join(sashaDir, 'c.json'), JSON.stringify({ id: 'c', toAgent: 'morgan', fromAgent: 'clementine', task: 'Task C', status: 'in_progress' }));
 
     const all = readAllDelegations(AGENTS_BASE);
     expect(all.length).toBe(3);
@@ -74,7 +74,7 @@ describe('Delegation CRUD', () => {
     expect(ids).toEqual(['a', 'b', 'c']);
 
     // Filter by agent
-    const rossOnly = all.filter(d => d.toAgent === 'ross');
+    const rossOnly = all.filter(d => d.toAgent === 'alex');
     expect(rossOnly.length).toBe(2);
   });
 

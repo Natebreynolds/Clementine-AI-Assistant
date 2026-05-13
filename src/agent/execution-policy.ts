@@ -22,6 +22,45 @@ export type ExecutionPermissionMode =
   | 'dontAsk'
   | 'auto';
 
+/**
+ * Maps a runAgent source to its default SDK permissionMode.
+ *
+ * Per the documented lane policy (see dashboard.ts self-diagnostic at
+ * /api/diagnostics/agent-config):
+ *   - chat        → bypassPermissions (trusted local owner; per the
+ *                   1.18.184 chat-path seam note + security model:
+ *                   "local machine is trusted")
+ *   - cron        → dontAsk (strict allowlist; scheduled lane is the
+ *   - heartbeat   →          most safety-critical because it runs
+ *   - team-task   →          unattended and may surface output to
+ *                            other channels)
+ *
+ * Callers MAY override by passing `permissionMode` explicitly on
+ * RunAgentOptions. This helper exists so autonomous lanes don't rely
+ * on the implicit `buildExecutionToolPolicy()` default — if that
+ * default ever changes, autonomous behavior would silently drift.
+ *
+ * The AutonomyProfile work (Commit 4 in the orchestrator-first
+ * sequence) will plug in here, allowing operators to widen autonomous
+ * lanes via an `aggressive` profile mode.
+ */
+export function defaultPermissionModeForLane(
+  source: string,
+): ExecutionPermissionMode {
+  switch (source) {
+    case 'chat':
+      return 'bypassPermissions';
+    case 'cron':
+    case 'heartbeat':
+    case 'team-task':
+      return 'dontAsk';
+    default:
+      // Unknown sources (test harnesses, plugins, future lanes) fail
+      // closed to the strict allowlist mode.
+      return 'dontAsk';
+  }
+}
+
 export const SDK_BUILTIN_TOOLS = new Set([
   'Agent',
   'AskUserQuestion',

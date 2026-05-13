@@ -114,7 +114,7 @@ describe('turn policy', () => {
   });
 
   it('surfaces routed tool turns explicitly', () => {
-    const d = decision('check the Outlook inbox for Ross follow-up replies');
+    const d = decision('check the Outlook inbox for Alex follow-up replies');
 
     expect(d.mode).toBe('tool_llm');
     expect(d.userVisibleStatus).toBe('checking tools');
@@ -123,6 +123,13 @@ describe('turn policy', () => {
 
   it('routes explicit sustained-work requests to background mode', () => {
     const d = decision('keep working on the repo audit in the background until it is done');
+
+    expect(d.mode).toBe('background');
+    expect(d.userVisibleStatus).toBe('working in background');
+  });
+
+  it('routes obvious durable batch workflows to background mode without magic wording', () => {
+    const d = decision('Research 100 businesses, put the results in Google Sheets, then draft Outlook emails.');
 
     expect(d.mode).toBe('background');
     expect(d.userVisibleStatus).toBe('working in background');

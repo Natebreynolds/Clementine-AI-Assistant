@@ -67,10 +67,10 @@ describe('buildAgentMap — system subagents', () => {
 
   it('researcher does NOT have a tools allowlist — inherits parent surface (1.18.198)', () => {
     // Before 1.18.198 researcher had a hardcoded allowlist that excluded
-    // every MCP server. When Ross dispatched "Parallel SEO enrichment for
-    // 13 domains" the subagent couldn't call mcp__dataforseo__* and fell
-    // back to "I cannot do this" — Ross then ran 25 sequential MCP calls
-    // in his own turn instead. The fix: omit `tools` so the subagent
+    // every MCP server. When a hired agent dispatched "Parallel SEO enrichment
+    // for 13 domains" the subagent couldn't call mcp__dataforseo__* and fell
+    // back to "I cannot do this" — the parent then ran 25 sequential MCP calls
+    // in its own turn instead. The fix: omit `tools` so the subagent
     // inherits parent's full tool surface. Safety lives in the prompt.
     const { researcher } = buildAgentMap();
     expect(researcher.tools).toBeUndefined();
@@ -109,25 +109,25 @@ describe('buildAgentMap — hired-agent profiles', () => {
   it('adds hired agents from profileManager (excluding clementine)', () => {
     const profiles = [
       makeProfile('clementine'),
-      makeProfile('ross-the-sdr', { description: 'SDR specialist', model: 'sonnet' }),
-      makeProfile('sasha-the-cmo', { description: 'CMO specialist' }),
+      makeProfile('sales-agent', { description: 'SDR specialist', model: 'sonnet' }),
+      makeProfile('marketing-agent', { description: 'CMO specialist' }),
     ];
     const map = buildAgentMap({ profileManager: fakeManager(profiles) });
-    expect(hasAgent(map, 'ross-the-sdr')).toBe(true);
-    expect(hasAgent(map, 'sasha-the-cmo')).toBe(true);
+    expect(hasAgent(map, 'sales-agent')).toBe(true);
+    expect(hasAgent(map, 'marketing-agent')).toBe(true);
     expect(hasAgent(map, 'clementine')).toBe(false);
   });
 
   it('hired-agent definitions inherit description from profile', () => {
-    const profiles = [makeProfile('ross-the-sdr', { description: 'Outbound SDR for cold outreach' })];
+    const profiles = [makeProfile('sales-agent', { description: 'Outbound SDR for cold outreach' })];
     const map = buildAgentMap({ profileManager: fakeManager(profiles) });
-    expect(map['ross-the-sdr'].description).toContain('Outbound SDR');
+    expect(map['sales-agent'].description).toContain('Outbound SDR');
   });
 
   it('hired agent gets sonnet by default', () => {
-    const profiles = [makeProfile('nora', { description: 'Senior SDR' })];
+    const profiles = [makeProfile('research-agent', { description: 'Senior SDR' })];
     const map = buildAgentMap({ profileManager: fakeManager(profiles) });
-    expect(map['nora'].model).toBe('sonnet');
+    expect(map['research-agent'].model).toBe('sonnet');
   });
 
   it('hired agent honors profile.model override', () => {
@@ -142,23 +142,32 @@ describe('buildAgentMap — hired-agent profiles', () => {
       team: { channelName: 'x', channels: [], canMessage: [], allowedTools: ['Read', 'Grep'] },
     })];
     const map = buildAgentMap({ profileManager: fakeManager(profiles) });
-    // `Agent` is always included so the subagent can further delegate;
-    // the profile's allowlist narrows the rest.
-    expect(map['locked-down'].tools).toEqual(['Agent', 'Read', 'Grep']);
+    // Hired-agent SDK definitions are leaf subagents by default. Recursive
+    // orchestration should be explicit/depth-limited, not inherited here.
+    expect(map['locked-down'].tools).toEqual(['Read', 'Grep']);
+  });
+
+  it('strips Agent from hired-agent allowedTools because SDK subagents are leaves', () => {
+    const profiles = [makeProfile('over-delegator', {
+      description: 'Restricted',
+      team: { channelName: 'x', channels: [], canMessage: [], allowedTools: ['Agent', 'Read'] },
+    })];
+    const map = buildAgentMap({ profileManager: fakeManager(profiles) });
+    expect(map['over-delegator'].tools).toEqual(['Read']);
   });
 
   it('skips the active agent (no recursion into self as subagent)', () => {
     const profiles = [
       makeProfile('clementine'),
-      makeProfile('ross-the-sdr', { description: 'SDR' }),
-      makeProfile('sasha-the-cmo', { description: 'CMO' }),
+      makeProfile('sales-agent', { description: 'SDR' }),
+      makeProfile('marketing-agent', { description: 'CMO' }),
     ];
     const map = buildAgentMap({
       profileManager: fakeManager(profiles),
-      activeAgentSlug: 'ross-the-sdr',
+      activeAgentSlug: 'sales-agent',
     });
-    expect(hasAgent(map, 'ross-the-sdr')).toBe(false);
-    expect(hasAgent(map, 'sasha-the-cmo')).toBe(true);
+    expect(hasAgent(map, 'sales-agent')).toBe(false);
+    expect(hasAgent(map, 'marketing-agent')).toBe(true);
   });
 
   it('returns only system subagents when no profileManager', () => {

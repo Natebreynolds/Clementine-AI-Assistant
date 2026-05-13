@@ -108,13 +108,13 @@ describe('buildClementineTurnContext — core', () => {
       userMessage: 'hi',
       sessionKey: 'discord:dm:owner',
       channel: 'discord-dm',
-      ownerName: 'Nathan',
-      profileName: 'Sasha',
+      ownerName: 'Owner',
+      profileName: 'Morgan',
       now: NOW,
     });
-    expect(result.block).toContain('Nathan');
+    expect(result.block).toContain('Owner');
     expect(result.block).toContain('discord-dm');
-    expect(result.block).toContain('Sasha');
+    expect(result.block).toContain('Morgan');
     expect(result.sections.identityFrame).toBe(true);
   });
 

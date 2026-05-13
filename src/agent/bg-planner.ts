@@ -4,7 +4,7 @@
  *
  * Why this exists (1.18.190)
  * ──────────────────────────
- * Before this, a complex multi-step user ask ("find the coaches project,
+ * Before this, a complex multi-step user ask ("find the catalog project,
  * build me an HTML report, deploy it to Netlify, verify the URL") got
  * handed to a single monolithic bg-task worker. The worker had its own
  * 200K context but still autocompact-thrashed because:
@@ -36,8 +36,7 @@
  * a multi-domain ask into proper steps is not mechanical.
  *
  * If you're tempted to "save tokens" by flipping this to Haiku, read
- * the 2026-05-12 root-cause plan first
- * (~/.claude/plans/look-at-the-last-vivid-rossum.md). The whole point
+ * a recent root-cause plan first. The whole point
  * of this ship is to NOT cut corners on the decomposition layer.
  */
 
@@ -55,7 +54,7 @@ const logger = pino({ name: 'clementine.bg-planner' });
 export interface PlanStep {
   /** 0-indexed position. */
   index: number;
-  /** Short imperative title (e.g., "Find the coaches project"). */
+  /** Short imperative title (e.g., "Find the catalog project"). */
   title: string;
   /** What this step does, in 1-2 sentences. The chained worker sees this. */
   scope: string;
@@ -279,7 +278,7 @@ function buildPlannerSystemPrompt(): string {
     '{',
     '  "steps": [',
     '    {',
-    '      "title": "<short imperative title, e.g. \'Find the coaches project\'>",',
+    '      "title": "<short imperative title, e.g. \'Find the catalog project\'>",',
     '      "scope": "<1-2 sentences describing exactly what this step does>",',
     '      "expectedTools": ["tool_name_1", "tool_name_2"],',
     '      "deliverable": "<file path | URL | description of the artifact>"',
@@ -350,7 +349,7 @@ async function runPlannerLlm(userPrompt: string, systemPrompt: string, model: st
   // Raw `systemPrompt: string` tells the SDK to use API-key auth, which
   // 99% of installs don't have configured — they're logged into Claude
   // Code, not the Anthropic API. This was the "Not logged in · Please
-  // run /login" failure Ross's owner hit on 2026-05-12.
+  // run /login" provider-auth failure.
   //
   // The preset injects Claude Code's default system prompt; our planning
   // instructions go in `append` and dominate behavior for the single

@@ -145,9 +145,9 @@ describe('active working set context', () => {
       type: 'cron_failure',
       sessionKey,
       title: '1 cron job failing',
-      summary: '1 cron job repeatedly failing. - ross-the-sdr:friday-scorecard: 0/0 recent runs failed | cause: The job reached its turn cap before finishing.',
+      summary: '1 cron job repeatedly failing. - sales-agent:friday-scorecard: 0/0 recent runs failed | cause: The job reached its turn cap before finishing.',
       text: 'Heartbeat notification.',
-      jobNames: ['ross-the-sdr:friday-scorecard'],
+      jobNames: ['sales-agent:friday-scorecard'],
       sentAt: '2026-05-05T11:55:00.000Z',
     }, { baseDir, now });
 

@@ -1,11 +1,11 @@
 /**
  * 1.18.199 — pin the chat path's MCP server registration to fullSurface.
  *
- * Live failure on 2026-05-12 13:35:33: Ross was mid-conversation about
- * sending a market-leader outreach batch. Owner replied "sure". The chat
+ * Regression case: a hired agent was mid-conversation about sending a
+ * market-leader outreach batch. Owner replied "sure". The chat
  * path called `buildExtraMcpForRunAgent({ scopeText: 'sure', ... })` —
  * `routeToolSurface('sure')` matched no MCPs, skill-resolver matched no
- * skills, result was an empty MCP server set for that turn. Ross then
+ * skills, result was an empty MCP server set for that turn. The agent then
  * said "DataForSEO isn't in scope for this session context" mid-task and
  * fell back to running `workflow list mcp tools` to figure out what he
  * even had access to.

@@ -1191,14 +1191,14 @@ export class MemoryStore {
 
     // User mental model — MemGPT-style core memory blocks always loaded into
     // the agent's context. Unlike chunks (retrieved on demand), these are
-    // the coherent "what we know about Nathan" surface: identifiers, lasting
+    // the coherent "what we know about Owner" surface: identifiers, lasting
     // preferences, active goals, key relationships, agent persona. Editable
     // by the agent via the user_model MCP tool, and by the user via the
     // dashboard "User Model" panel. Hard char_limit per slot prevents bloat.
     //
     // Per-agent isolation: agent_slug NULL = global (main user model).
     // Specific slug = per-agent override (e.g., the SDR agent has its own
-    // sense of who Nathan is in that working relationship).
+    // sense of who Owner is in that working relationship).
     this.conn.exec(`
       CREATE TABLE IF NOT EXISTS user_model_blocks (
         id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -60,7 +60,7 @@ describe('run summary', () => {
         kind: 'tool_call',
         toolName: 'Write',
         toolUseId: 'write-1',
-        toolInput: { file_path: '/tmp/coach-recruiting-report.html', content: '<html></html>' },
+        toolInput: { file_path: '/tmp/product-site-report.html', content: '<html></html>' },
       }));
       log.append(ev({
         runId: 'run-b',
@@ -70,7 +70,7 @@ describe('run summary', () => {
         toolResult: {
           successful: true,
           _clementine_large_write_guard: true,
-          filePath: '/tmp/coach-recruiting-report.html',
+          filePath: '/tmp/product-site-report.html',
         },
       }));
       log.append(ev({
@@ -87,7 +87,7 @@ describe('run summary', () => {
         kind: 'tool_call',
         toolName: 'Agent',
         toolUseId: 'agent-1',
-        toolInput: { subagent_type: 'discovery', description: 'Map Track Coaches project' },
+        toolInput: { subagent_type: 'discovery', description: 'Map product site project' },
       }));
       log.append(ev({
         runId: 'run-b',
@@ -100,7 +100,7 @@ describe('run summary', () => {
             text: [
               '[Clementine compacted this Agent result to protect the parent chat context.]',
               'Subagent: discovery',
-              'Task: Map Track Coaches project',
+              'Task: Map product site project',
               'agentId: abc123',
               'Full payload archived at `/tmp/full-agent-result.json` — call `Read` on that path for the full Agent result.',
               '',
@@ -117,7 +117,7 @@ describe('run summary', () => {
         toolName: 'Bash',
         toolUseId: 'netlify-fail',
         toolInput: {
-          command: 'cd "/tmp/Track Coaches" && netlify deploy --prod --dir=. --site=jacob-thompson-recruiting 2>&1 | tail -40',
+          command: 'cd "/tmp/product-site" && netlify deploy --prod --dir=. --site=example-product-site 2>&1 | tail -40',
         },
       }));
       log.append(ev({
@@ -150,11 +150,11 @@ describe('run summary', () => {
       const prompt = buildContinuationPrompt(summary, 'fire off those emails');
       expect(prompt).toContain('DO NOT re-run completed side effects');
       expect(prompt).toContain('kevin@example.com');
-      expect(prompt).toContain('/tmp/coach-recruiting-report.html');
+      expect(prompt).toContain('/tmp/product-site-report.html');
       expect(prompt).toContain('Denver legal search');
       expect(prompt).toContain('logId log_123');
       expect(prompt).toContain('Do not repeat discovery/research');
-      expect(prompt).toContain('Map Track Coaches project');
+      expect(prompt).toContain('Map product site project');
       expect(prompt).toContain('Failed side effects');
       expect(prompt).toContain('netlify deploy --prod');
       expect(prompt).toContain('Project not found. Please rerun "netlify link"');

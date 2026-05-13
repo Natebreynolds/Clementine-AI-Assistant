@@ -40,10 +40,10 @@ describe('prompt overrides loader', () => {
   });
 
   it('agent-scoped override only applies to that agent', () => {
-    writeOverride('agents/ross.md', 'Ross-specific guidance.');
-    const matched = loadPromptOverridesForJob('any-job', 'ross', { baseDir });
-    const unmatched = loadPromptOverridesForJob('any-job', 'sasha', { baseDir });
-    expect(matched).toBe('Ross-specific guidance.');
+    writeOverride('agents/alex.md', 'Alex-specific guidance.');
+    const matched = loadPromptOverridesForJob('any-job', 'alex', { baseDir });
+    const unmatched = loadPromptOverridesForJob('any-job', 'morgan', { baseDir });
+    expect(matched).toBe('Alex-specific guidance.');
     expect(unmatched).toBe('');
   });
 
@@ -57,15 +57,15 @@ describe('prompt overrides loader', () => {
 
   it('job-scoped override for an agent cron matches the bare job name', () => {
     writeOverride('jobs/content-intel-brief.md', 'Use batches of 20.');
-    const matched = loadPromptOverridesForJob('sasha-the-cmo:content-intel-brief', 'sasha-the-cmo', { baseDir });
+    const matched = loadPromptOverridesForJob('marketing-agent:content-intel-brief', 'marketing-agent', { baseDir });
     expect(matched).toBe('Use batches of 20.');
   });
 
   it('concatenates global + agent + job in priority order (lower first)', () => {
     writeOverride('_global.md', 'GLOBAL');
-    writeOverride('agents/ross.md', 'AGENT');
+    writeOverride('agents/alex.md', 'AGENT');
     writeOverride('jobs/reply-detection.md', 'JOB');
-    const out = loadPromptOverridesForJob('reply-detection', 'ross', { baseDir });
+    const out = loadPromptOverridesForJob('reply-detection', 'alex', { baseDir });
     // Default priorities: global=10 < agent=50 < job=100
     expect(out).toBe('GLOBAL\n\nAGENT\n\nJOB');
   });

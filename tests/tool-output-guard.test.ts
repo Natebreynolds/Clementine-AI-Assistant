@@ -143,17 +143,17 @@ describe('compressToolOutput', () => {
     const report = [
       'Perfect. Now I have all the information needed. Let me compile the structured report:',
       '',
-      '## Track Coaches Project — Structural Map',
+      '## Product Site Project — Structural Map',
       '',
       '**Total files:** 21',
       '',
       '### Top-Level Files',
-      '- Coach_Data_From_Runcruit.tsv (101 rows) — Runcruit export',
-      '- College_Track_Coaches_Top100_with_Contacts.csv (101 rows) — expanded contacts',
-      '- Jacob_Thompson_Recruiting_Tracker.xlsx (557K) — primary workbook',
+      '- Product_Inventory.tsv (101 rows) — source export',
+      '- Product_Contacts.csv (101 rows) — expanded contacts',
+      '- Product_Site_Content.xlsx (557K) — primary workbook',
       '',
       '## Project Summary',
-      'This is a track recruiting project centered on Jacob Thompson.',
+      'This is a product site project centered on a launch campaign.',
       '',
       '## Long tail detail',
       'x'.repeat(12_000),
@@ -166,7 +166,7 @@ describe('compressToolOutput', () => {
     const out = compressToolOutput('Agent', payload, {
       toolName: 'Agent',
       toolUseId: 'tu_agent',
-      toolInput: { subagent_type: 'discovery', description: 'Map Track Coaches project' },
+      toolInput: { subagent_type: 'discovery', description: 'Map product site project' },
       archivePath: '/tmp/full-agent-result.json',
       cap: 2_500,
     });
@@ -176,7 +176,7 @@ describe('compressToolOutput', () => {
     const text = out.output as string;
     expect(estimateBytes(text)).toBeLessThanOrEqual(2_500);
     expect(text).toContain('Subagent: discovery');
-    expect(text).toContain('Task: Map Track Coaches project');
+    expect(text).toContain('Task: Map product site project');
     expect(text).toContain('agentId: abc5c2649a209c3bc');
     expect(text).toContain('/tmp/full-agent-result.json');
     expect(text).not.toContain('x'.repeat(500));

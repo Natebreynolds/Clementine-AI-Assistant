@@ -1,8 +1,7 @@
 /**
  * Clementine TypeScript — runAgent team-task wrapper.
  *
- * Phase 4 of the SDK-canonical migration (see
- * /Users/nathan.reynolds/.claude/plans/sdk-canonical-migration.md).
+ * Phase 4 of the SDK-canonical migration.
  *
  * A "team task" is one hired agent (or Clementine herself) sending a
  * direct message to another agent. The recipient processes it
@@ -19,6 +18,7 @@ import type { AgentProfile } from '../types.js';
 import type { AgentManager } from './agent-manager.js';
 import type { MemoryStore } from '../memory/store.js';
 import { runAgent, type RunAgentResult } from './run-agent.js';
+import { defaultPermissionModeForLane } from './execution-policy.js';
 import { buildExtraMcpForRunAgent } from './run-agent-mcp.js';
 import { buildAutonomousMemoryContext } from './run-agent-context.js';
 
@@ -87,7 +87,7 @@ export async function runAgentTeamTask(opts: RunAgentTeamTaskOptions): Promise<R
   const memoryContext = buildAutonomousMemoryContext(opts.profile);
 
   // Match the legacy phase-1 prompt shape so existing agent training
-  // (Sasha/Ross/Nora) keeps responding the same way. Phases 2+ are no
+  // keeps responding the same way. Phases 2+ are no
   // longer needed — the SDK keeps the conversation in one session.
   const builtPrompt =
     `[TEAM MESSAGE from ${opts.fromName} (${opts.fromSlug}) — ${timestamp}]\n\n` +
@@ -123,6 +123,9 @@ export async function runAgentTeamTask(opts: RunAgentTeamTaskOptions): Promise<R
   const result = await runAgent(builtPrompt, {
     sessionKey,
     source: 'team-task',
+    // Explicit lane policy — team-task is agent-to-agent autonomous
+    // work, not direct owner chat. Pinned strict-allowlist mode.
+    permissionMode: defaultPermissionModeForLane('team-task'),
     profile: opts.profile,
     agentManager: opts.agentManager,
     memoryStore: opts.memoryStore,

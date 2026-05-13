@@ -13,7 +13,7 @@
  *   ## Owner approval signals (recent)
  *   APPROVED (do more like this):
  *   - cron/insight-check: "Apply lean mode to reduce prompt size"
- *   - agent/sasha-the-cmo: "Add explicit citation requirement to system prompt"
+ *   - agent/marketing-agent: "Add explicit citation requirement to system prompt"
  *
  *   DENIED (avoid these patterns):
  *   - workflow/email-gen: "Replace template with LLM generation"  ← user note: "too generic; loses voice"
@@ -41,7 +41,7 @@ export interface ApprovalSignal {
   experimentId: string;
   /** The area the proposal targeted (cron, agent, skill, soul, etc.). */
   area: string;
-  /** The specific target (e.g., "insight-check", "sasha-the-cmo"). */
+  /** The specific target (e.g., "insight-check", "marketing-agent"). */
   target: string;
   /** The proposal's one-sentence hypothesis (truncated to 200 chars). */
   hypothesis: string;

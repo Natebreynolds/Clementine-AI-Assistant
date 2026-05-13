@@ -59,7 +59,7 @@ describe('memory promotion candidates', () => {
   it('records promotion decisions', () => {
     const id = store.recordMemoryPromotionCandidate({
       candidateKind: 'fact',
-      contentPreview: 'Ross owns the market leader follow-up workflow.',
+      contentPreview: 'Alex owns the market leader follow-up workflow.',
       confidence: 0.7,
       salience: 0.6,
     });

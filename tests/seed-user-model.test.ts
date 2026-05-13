@@ -56,11 +56,11 @@ describe('seedUserModelFromMemory', () => {
   });
 
   it('parses well-formed Haiku output into the four slots', async () => {
-    insertChunk('Nathan works at Breakthrough Coaching as the founder.', 0.9);
+    insertChunk('Owner works at ExampleCo as the founder.', 0.9);
     insertChunk('Currently shipping the Clementine memory upgrade.', 0.8);
 
     const fakeResponse = `## user_facts
-- Nathan, founder of Breakthrough Coaching
+- Owner, founder of ExampleCo
 - Prefers terse responses
 
 ## goals
@@ -76,8 +76,8 @@ describe('seedUserModelFromMemory', () => {
     const result = await seedUserModelFromMemory(store as any, llm, NO_MEM_FILE);
 
     expect(result.sourceCount).toBeGreaterThan(0);
-    expect(result.user_facts).toContain('Nathan');
-    expect(result.user_facts).toContain('Breakthrough Coaching');
+    expect(result.user_facts).toContain('Owner');
+    expect(result.user_facts).toContain('ExampleCo');
     expect(result.goals).toContain('Clementine memory upgrade');
     expect(result.relationships).toContain('Sam');
     expect(result.agent_persona).toContain('always-in-context');
@@ -197,9 +197,9 @@ short`;
   });
 
   it('seed proposals can be applied into renderUserModel for prompt injection', async () => {
-    insertChunk('Nathan prefers concise implementation summaries after tests pass.', 0.9);
+    insertChunk('Owner prefers concise implementation summaries after tests pass.', 0.9);
     const fakeResponse = `## user_facts
-- Nathan prefers concise implementation summaries
+- Owner prefers concise implementation summaries
 
 ## goals
 - Keep Clementine memory retrieval tight
@@ -217,7 +217,7 @@ short`;
 
     const rendered = store.renderUserModel();
     expect(rendered).toContain('User Facts');
-    expect(rendered).toContain('Nathan prefers concise implementation summaries');
+    expect(rendered).toContain('Owner prefers concise implementation summaries');
     expect(rendered).toContain('Active Goals');
     expect(rendered).toContain('Keep Clementine memory retrieval tight');
   });

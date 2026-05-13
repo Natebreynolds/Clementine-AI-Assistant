@@ -14,9 +14,9 @@ import type { ProjectMeta } from '../src/agent/assistant.js';
 describe('resolveProjectFromMessage (1.18.187 Part A)', () => {
   const projects: ProjectMeta[] = [
     {
-      path: '/Users/me/Downloads/track-coaches',
-      description: '100 coaches HTML report',
-      keywords: ['coaches', 'track-coaches', 'recruiting'],
+      path: '/Users/me/Downloads/product-catalog',
+      description: '100 product records HTML report',
+      keywords: ['catalog', 'product-catalog', 'recruiting'],
     },
     {
       path: '/Users/me/Desktop/Proposal Builder',
@@ -31,11 +31,11 @@ describe('resolveProjectFromMessage (1.18.187 Part A)', () => {
   ];
 
   it('matches a registered keyword (whole word) with high confidence', () => {
-    const match = resolveProjectFromMessage('back to the coaches project, build me a report', { projects });
+    const match = resolveProjectFromMessage('back to the catalog project, build me a report', { projects });
     expect(match).not.toBeNull();
-    expect(match?.project.path).toContain('track-coaches');
+    expect(match?.project.path).toContain('product-catalog');
     expect(match?.matchedVia).toBe('keyword');
-    expect(match?.matchedTerm).toBe('coaches');
+    expect(match?.matchedTerm).toBe('catalog');
     expect(match?.confidence).toBeGreaterThanOrEqual(0.9);
   });
 
@@ -59,8 +59,8 @@ describe('resolveProjectFromMessage (1.18.187 Part A)', () => {
   });
 
   it('does NOT falsely match keyword substring inside an unrelated word', () => {
-    // "approaches" contains "coaches" as a substring but the keyword
-    // check is whole-word only. The basename "track-coaches" doesn't
+    // "approaches" contains "catalog" as a substring but the keyword
+    // check is whole-word only. The basename "product-catalog" doesn't
     // appear in the message as a whole word or substring either.
     // So this message should resolve to NULL — no false positive.
     const match = resolveProjectFromMessage('different approaches to consider', { projects });
@@ -68,7 +68,7 @@ describe('resolveProjectFromMessage (1.18.187 Part A)', () => {
   });
 
   it('returns null for empty projects list', () => {
-    expect(resolveProjectFromMessage('the coaches project', { projects: [] })).toBeNull();
+    expect(resolveProjectFromMessage('the catalog project', { projects: [] })).toBeNull();
   });
 
   it('returns null for empty message', () => {
@@ -90,13 +90,13 @@ describe('resolveProjectFromMessage (1.18.187 Part A)', () => {
     // A message that touches multiple projects' keywords — should pick
     // the strongest by confidence, which is the keyword whole-word match.
     const match = resolveProjectFromMessage(
-      'use the coaches project but also salesforce data',
+      'use the catalog project but also salesforce data',
       { projects },
     );
-    // Both 'coaches' (track-coaches keyword) and 'salesforce' (Marketing Intel
-    // keyword) hit; both at confidence 0.95. First-matched wins (track-coaches
+    // Both 'catalog' (product-catalog keyword) and 'salesforce' (Marketing Intel
+    // keyword) hit; both at confidence 0.95. First-matched wins (product-catalog
     // is first in the array). Behavior is deterministic; test pins it.
-    expect(match?.project.path).toContain('track-coaches');
+    expect(match?.project.path).toContain('product-catalog');
   });
 });
 
@@ -117,22 +117,22 @@ describe('discoverProjectCandidates (1.18.187 Part G)', () => {
   // of what mdfind finds on the test machine. Spotlight coverage is in
   // its own integration check below.
   it('finds a folder whose name matches the search term', () => {
-    fs.mkdirSync(path.join(tmpHome, 'coaches'), { recursive: true });
-    fs.writeFileSync(path.join(tmpHome, 'coaches', 'data.csv'), 'col1,col2\n1,2');
-    const candidates = discoverProjectCandidates('coaches', { searchRoots: [tmpHome], disableSpotlight: true });
+    fs.mkdirSync(path.join(tmpHome, 'catalog'), { recursive: true });
+    fs.writeFileSync(path.join(tmpHome, 'catalog', 'data.csv'), 'col1,col2\n1,2');
+    const candidates = discoverProjectCandidates('catalog', { searchRoots: [tmpHome], disableSpotlight: true });
     expect(candidates.length).toBeGreaterThan(0);
-    expect(candidates[0]?.basename).toBe('coaches');
+    expect(candidates[0]?.basename).toBe('catalog');
     expect(candidates[0]?.nameScore).toBe(1.0);
   });
 
   it('ranks an exact name match above a substring match', () => {
-    fs.mkdirSync(path.join(tmpHome, 'coaches'), { recursive: true });
-    fs.mkdirSync(path.join(tmpHome, 'track-coaches-2024'), { recursive: true });
-    fs.writeFileSync(path.join(tmpHome, 'coaches', 'data.csv'), 'a');
-    fs.writeFileSync(path.join(tmpHome, 'track-coaches-2024', 'data.csv'), 'a');
-    const candidates = discoverProjectCandidates('coaches', { searchRoots: [tmpHome], disableSpotlight: true });
+    fs.mkdirSync(path.join(tmpHome, 'catalog'), { recursive: true });
+    fs.mkdirSync(path.join(tmpHome, 'product-catalog-2024'), { recursive: true });
+    fs.writeFileSync(path.join(tmpHome, 'catalog', 'data.csv'), 'a');
+    fs.writeFileSync(path.join(tmpHome, 'product-catalog-2024', 'data.csv'), 'a');
+    const candidates = discoverProjectCandidates('catalog', { searchRoots: [tmpHome], disableSpotlight: true });
     expect(candidates.length).toBeGreaterThanOrEqual(2);
-    expect(candidates[0]?.basename).toBe('coaches');
+    expect(candidates[0]?.basename).toBe('catalog');
     expect(candidates[0]!.totalScore).toBeGreaterThan(candidates[1]!.totalScore);
   });
 
@@ -163,11 +163,11 @@ describe('discoverProjectCandidates (1.18.187 Part G)', () => {
 
   it('limits results to maxResults', () => {
     for (let i = 0; i < 10; i++) {
-      const dir = path.join(tmpHome, `coaches-${i}`);
+      const dir = path.join(tmpHome, `catalog-${i}`);
       fs.mkdirSync(dir, { recursive: true });
       fs.writeFileSync(path.join(dir, 'data.csv'), 'a');
     }
-    const candidates = discoverProjectCandidates('coaches', {
+    const candidates = discoverProjectCandidates('catalog', {
       searchRoots: [tmpHome],
       maxResults: 3,
       disableSpotlight: true, // avoid system-wide noise

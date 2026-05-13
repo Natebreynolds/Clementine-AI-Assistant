@@ -3093,7 +3093,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         } catch { /* */ }
       }
       if (!userName) userName = 'there';
-      // Capitalize first letter so "nathan" → "Nathan"
+      // Capitalize first letter so a username becomes a display name.
       userName = userName.charAt(0).toUpperCase() + userName.slice(1);
 
       // ── KPIs ──
@@ -6574,7 +6574,8 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
   //
   // Lightweight endpoint to verify the new canonical SDK call path
   // without rerouting any production traffic. Owner-only.
-  // Migration plan: /Users/nathan.reynolds/.claude/plans/sdk-canonical-migration.md
+  // Migration plan was tracked outside this endpoint; keep this route as a
+  // lightweight canary for the canonical SDK call path.
   app.post('/api/runagent/test', async (req, res) => {
     const { prompt, agentSlug, forceSubagent, model, effort, maxBudgetUsd, source } = req.body ?? {};
     if (!prompt || typeof prompt !== 'string') {
@@ -19746,7 +19747,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             </div>
             <!-- 1.18.127 — MEMORY.md inline editor. Lets the user seed
                  long-term memory directly without leaving the dashboard.
-                 Per-agent toggle (global / Sasha / Ross / …) reads + writes
+                 Per-agent toggle (global / agent / …) reads + writes
                  the right MEMORY.md file. mtime conflict-detection blocks
                  clobbering an Obsidian save mid-edit. -->
             <div class="card" style="margin-bottom:14px">
@@ -22482,7 +22483,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           </div>
           <div class="form-group">
             <label class="form-label">Success criterion <span style="color:var(--text-muted);font-weight:normal">(plain English)</span></label>
-            <textarea id="cron-success-criteria-text" rows="3" placeholder="e.g. 'A daily briefing email was sent to nathan@example.com containing the top 3 overnight items.'" oninput="updateGoalWarning()"></textarea>
+            <textarea id="cron-success-criteria-text" rows="3" placeholder="e.g. 'A daily briefing email was sent to owner@example.com containing the top 3 overnight items.'" oninput="updateGoalWarning()"></textarea>
             <div class="form-hint">An evaluator sub-agent reads the run's output and this criterion, then emits pass/fail with reasoning.</div>
           </div>
           <div class="form-group" style="margin-bottom:0">
@@ -43696,8 +43697,8 @@ try {
           // Identity from the SSE payload \u2014 server-side
           // dashboard sender resolves agentSlug + agentName from
           // the dispatcher context (cron jobs, hired-agent
-          // workflows, heartbeats), so a Sasha-cron completion
-          // renders with Sasha's initial + name in the meta line
+          // workflows, heartbeats), so an agent-scoped cron completion
+          // renders with that agent's initial + name in the meta line
           // instead of looking like Clementine sent it. Falls
           // back to Clementine when the event is unowned.
           var deepSlug = (evt.data && evt.data.agentSlug) ? evt.data.agentSlug : null;

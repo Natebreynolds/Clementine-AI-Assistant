@@ -26,20 +26,20 @@ describe('background-tasks persistence helper', () => {
 
   it('creates a pending task with a sortable id and persists to disk', () => {
     const t = createBackgroundTask(
-      { fromAgent: 'ross-the-sdr', prompt: 'Research the Acme account', maxMinutes: 15, sessionKey: 'discord:member-dm:ross-the-sdr:user-1' },
+      { fromAgent: 'sales-agent', prompt: 'Research the Acme account', maxMinutes: 15, sessionKey: 'discord:member-dm:sales-agent:user-1' },
       { dir },
     );
     expect(t.id).toMatch(/^bg-[a-z0-9]+-[a-f0-9]{6}$/);
     expect(t.status).toBe('pending');
-    expect(t.fromAgent).toBe('ross-the-sdr');
+    expect(t.fromAgent).toBe('sales-agent');
     expect(t.maxMinutes).toBe(15);
-    expect(t.sessionKey).toBe('discord:member-dm:ross-the-sdr:user-1');
+    expect(t.sessionKey).toBe('discord:member-dm:sales-agent:user-1');
     expect(existsSync(path.join(dir, `${t.id}.json`))).toBe(true);
 
     const onDisk = JSON.parse(readFileSync(path.join(dir, `${t.id}.json`), 'utf-8'));
     expect(onDisk.id).toBe(t.id);
     expect(onDisk.status).toBe('pending');
-    expect(onDisk.sessionKey).toBe('discord:member-dm:ross-the-sdr:user-1');
+    expect(onDisk.sessionKey).toBe('discord:member-dm:sales-agent:user-1');
   });
 
   it('clamps maxMinutes to [1, 240]', () => {
@@ -50,7 +50,7 @@ describe('background-tasks persistence helper', () => {
   });
 
   it('round-trips status transitions: pending → running → done', () => {
-    const t = createBackgroundTask({ fromAgent: 'sasha', prompt: 'do it', maxMinutes: 5 }, { dir });
+    const t = createBackgroundTask({ fromAgent: 'morgan', prompt: 'do it', maxMinutes: 5 }, { dir });
     expect(loadBackgroundTask(t.id, { dir })?.status).toBe('pending');
 
     markRunning(t.id, { dir }, { jobName: `bg:${t.id}` });

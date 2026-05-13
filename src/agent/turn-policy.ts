@@ -7,6 +7,7 @@
  */
 
 import { routeToolSurface, type ToolRouteDecision } from './tool-router.js';
+import { detectComplexTaskForBackground } from './complex-task-detector.js';
 import type { IntentClassification } from './intent-classifier.js';
 
 export type RetrievalTier = 'none' | 'core' | 'search' | 'full';
@@ -262,10 +263,9 @@ export function decideTurn(input: TurnPolicyInput): TurnDecision {
   const policy = decideTurnPolicy(input);
   const toolRoute = routeToolSurface(input.text);
   const text = input.text.trim();
-  const wantsBackground = /\b(background|deep mode|keep working|don't stop|dont stop|run in the background|autonomous)\b/i.test(text);
-  const explicitWork = /\b(work|task|do|run|fix|implement|audit|research|analy[sz]e|review|build|ship|finish|complete|continue|handle)\b/i.test(text);
+  const backgroundRecommendation = detectComplexTaskForBackground(text);
   const needsTools = !policy.disableAllTools || toolRoute.fullSurface || toolRoute.bundles.length > 0;
-  const backgroundRequested = wantsBackground && needsTools && (explicitWork || policy.enableTeams || policy.retrievalTier === 'full');
+  const backgroundRequested = Boolean(backgroundRecommendation) && needsTools;
 
   let mode: TurnExecutionMode;
   if (input.isAutonomous || backgroundRequested) {

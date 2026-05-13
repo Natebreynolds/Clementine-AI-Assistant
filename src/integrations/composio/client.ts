@@ -13,22 +13,135 @@
  * returns an empty result, never throws.
  */
 
+import { execSync } from 'node:child_process';
+import { existsSync, readFileSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { Composio } from '@composio/core';
 import { ClaudeAgentSDKProvider } from '@composio/claude-agent-sdk';
 import pino from 'pino';
-import { getEnv } from '../../config.js';
+import { parseEnvText, shellEscape } from '../../config/env-parser.js';
 
 const logger = pino({ name: 'clementine.composio' });
 
 // `process.env` is intentionally NOT populated from .env (config.ts keeps
-// secrets out of the SDK subprocess). Reading process.env.COMPOSIO_API_KEY
-// directly works during the dashboard's hot-reload (PUT handler mutates
-// process.env), but is empty after a fresh daemon restart even if the key
-// is in .env. Use this helper everywhere we read Composio env vars: it
-// prefers process.env (hot-reload from dashboard) and falls back to the
-// .env file via getEnv (survives restarts).
+// secrets out of the SDK subprocess). The Composio client only needs two env
+// values, so read them through this tiny local loader instead of importing the
+// full config module, which eagerly resolves many unrelated secrets/keychain
+// refs on load.
+const KEYCHAIN_REF_PREFIX = 'keychain:'; // pragma: allowlist secret
+const resolvedKeychainRefs = new Map<string, string | null>();
+let localEnvCache: { baseDir: string; env: Record<string, string> } | null = null;
+
+function composioBaseDir(): string {
+  return process.env.CLEMENTINE_HOME || path.join(os.homedir(), '.clementine');
+}
+
+function readLocalEnv(): Record<string, string> {
+  const baseDir = composioBaseDir();
+  if (localEnvCache?.baseDir === baseDir) return localEnvCache.env;
+  const envPath = path.join(baseDir, '.env');
+  let env: Record<string, string> = {};
+  if (existsSync(envPath)) {
+    try {
+      env = parseEnvText(readFileSync(envPath, 'utf-8'));
+    } catch {
+      env = {};
+    }
+  }
+  localEnvCache = { baseDir, env };
+  return env;
+}
+
+function resolveKeychainRef(stub: string): string | undefined {
+  if (resolvedKeychainRefs.has(stub)) {
+    return resolvedKeychainRefs.get(stub) ?? undefined;
+  }
+  const account = stub.slice(KEYCHAIN_REF_PREFIX.length);
+  const localEnv = readLocalEnv();
+  const timeoutMs = Math.max(
+    500,
+    parseInt(localEnv.CLEMENTINE_KEYCHAIN_TIMEOUT_MS ?? process.env.CLEMENTINE_KEYCHAIN_TIMEOUT_MS ?? '3000', 10) || 3000,
+  );
+  try {
+    const result = execSync(
+      `security find-generic-password -s clementine-agent -a ${shellEscape(account)} -w`,
+      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: timeoutMs },
+    ).trim();
+    resolvedKeychainRefs.set(stub, result || null);
+    return result || undefined;
+  } catch {
+    resolvedKeychainRefs.set(stub, null);
+    return undefined;
+  }
+}
+
+function maybeResolveEnvValue(value: string | undefined): string | undefined {
+  if (!value) return value;
+  if (!value.startsWith(KEYCHAIN_REF_PREFIX)) return value;
+  return resolveKeychainRef(value);
+}
+
 function readComposioEnv(key: string): string {
-  return process.env[key] || getEnv(key, '');
+  const fromProcess = maybeResolveEnvValue(process.env[key]);
+  if (fromProcess) return fromProcess;
+  const fromLocal = maybeResolveEnvValue(readLocalEnv()[key]);
+  return fromLocal || '';
+}
+
+function normalizeSearchText(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function containsSearchTerm(normalizedText: string, rawTerm: string | undefined): boolean {
+  if (!rawTerm) return false;
+  const term = normalizeSearchText(rawTerm);
+  if (term.length < 3) return false;
+  if (term.includes(' ')) return normalizedText.includes(term);
+  return new RegExp(`(?:^|\\s)${escapeRegExp(term)}(?:$|\\s)`).test(normalizedText);
+}
+
+function toolkitSearchTerms(conn: ConnectedToolkit): string[] {
+  const slugSpaced = conn.slug.replace(/[-_]+/g, ' ');
+  const display = displayNameFor(conn.slug);
+  return [
+    conn.slug,
+    slugSpaced,
+    display,
+    conn.alias,
+    conn.accountLabel,
+    conn.accountEmail,
+    conn.accountName,
+  ].filter((term): term is string => typeof term === 'string' && term.trim().length > 0);
+}
+
+/**
+ * Match arbitrary active Composio connections mentioned by the user. The
+ * static tool router knows common services; this covers the long tail of
+ * Composio OAuth apps without mounting every connected toolkit by default.
+ */
+export function matchConnectedToolkitsInText(
+  text: string | undefined,
+  connected: ConnectedToolkit[],
+): string[] {
+  const normalizedText = normalizeSearchText(text ?? '');
+  if (!normalizedText) return [];
+  const matches = new Set<string>();
+  for (const conn of connected) {
+    if (conn.status !== 'ACTIVE') continue;
+    if (toolkitSearchTerms(conn).some(term => containsSearchTerm(normalizedText, term))) {
+      matches.add(conn.slug);
+    }
+  }
+  return [...matches].sort();
 }
 
 export type ToolkitAuthMode = 'managed' | 'byo';
@@ -42,8 +155,8 @@ export interface CuratedToolkit {
   authMode: ToolkitAuthMode;
 }
 
-// Curated set surfaced in the dashboard. Composio exposes 1000+ — rendering
-// them all is noisy. Users can still connect anything by editing this list.
+// Common display labels / fallbacks. The dashboard renders Composio's live
+// catalog via listAllToolkits(), so this list is not a connection allowlist.
 export const CURATED_TOOLKITS: CuratedToolkit[] = [
   { slug: 'gmail', displayName: 'Gmail', authMode: 'managed' },
   { slug: 'googlecalendar', displayName: 'Google Calendar', authMode: 'managed' },
@@ -102,6 +215,8 @@ export function resetComposioClient(): void {
   catalogCache = null;
   detectedPreferredUserId = null;
   connectionsCache = null;
+  localEnvCache = null;
+  resolvedKeychainRefs.clear();
   void busComposioMcpCache();
 }
 

@@ -1,8 +1,7 @@
 /**
  * Clementine TypeScript — runAgent cron wrapper.
  *
- * Phase 3 of the SDK-canonical migration (see
- * /Users/nathan.reynolds/.claude/plans/sdk-canonical-migration.md).
+ * Phase 3 of the SDK-canonical migration.
  *
  * Cron jobs need more than a bare runAgent() call: they get progress
  * continuity, linked goals, delegated tasks, team context, success
@@ -29,6 +28,7 @@ import type { AgentProfile } from '../types.js';
 import type { AgentManager } from './agent-manager.js';
 import type { MemoryStore } from '../memory/store.js';
 import { runAgent, type RunAgentResult } from './run-agent.js';
+import { defaultPermissionModeForLane } from './execution-policy.js';
 import { buildExtraMcpForRunAgent } from './run-agent-mcp.js';
 import { buildAutonomousMemoryContext } from './run-agent-context.js';
 import { listAllGoals } from '../tools/shared.js';
@@ -650,7 +650,7 @@ export interface RunAgentCronOptions {
   tier?: number;
   /** Optional max-turns cap (the SDK runs until done otherwise, bounded by maxBudget). */
   maxTurns?: number;
-  /** Profile of the hired agent running this job (Sasha/Ross/Nora/etc). null = Clementine. */
+  /** Profile of the hired agent running this job. null = Clementine. */
   profile?: AgentProfile | null;
   /** Hired-agent registry — passed through to runAgent so subagent delegation works. */
   agentManager?: AgentManager | null;
@@ -1041,6 +1041,10 @@ export async function runAgentCron(opts: RunAgentCronOptions): Promise<RunAgentC
   const result = await runAgent(builtPrompt, {
     sessionKey: `cron:${opts.jobName}`,
     source: 'cron',
+    // Explicit lane policy — autonomous cron stays on the strict
+    // allowlist mode. Pinned so a future change to
+    // buildExecutionToolPolicy's default can't silently widen us.
+    permissionMode: defaultPermissionModeForLane('cron'),
     profile: opts.profile,
     agentManager: opts.agentManager,
     memoryStore: opts.memoryStore,
@@ -1066,7 +1070,7 @@ export async function runAgentCron(opts: RunAgentCronOptions): Promise<RunAgentC
 
   // Mirror the run into transcripts so future chat recall can see it.
   // Legacy runCronJob did this with role='cron'; canonical needs the
-  // same so memory queries (`what did Sasha do this morning?`) work.
+  // same so memory queries about an agent's work history stay scoped.
   const deliverable = result.text ?? '';
   if (opts.memoryStore && deliverable.trim()) {
     try {

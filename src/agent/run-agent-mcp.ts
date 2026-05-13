@@ -1,8 +1,7 @@
 /**
  * Clementine TypeScript — MCP server wiring helper for runAgent.
  *
- * Phase 3 of the SDK-canonical migration (see
- * /Users/nathan.reynolds/.claude/plans/sdk-canonical-migration.md).
+ * Phase 3 of the SDK-canonical migration.
  *
  * runAgent always wires the Clementine MCP server. This helper builds
  * the EXTRA MCP servers callers may need (Composio toolkits, external
@@ -56,6 +55,31 @@ export interface BuildExtraMcpResult {
   /** Diagnostics: which services were de-duped (we kept Composio over claude.ai etc). */
   droppedClaudeAi: string[];
   droppedComposio: string[];
+}
+
+async function widenRouteWithMentionedComposioToolkits(
+  route: ToolRouteDecision,
+  scopeText: string | undefined,
+): Promise<ToolRouteDecision> {
+  if (route.fullSurface || !Array.isArray(route.composioToolkits) || !scopeText?.trim()) {
+    return route;
+  }
+  try {
+    const { listConnectedToolkits, matchConnectedToolkitsInText } =
+      await import('../integrations/composio/client.js');
+    const connected = await listConnectedToolkits();
+    const mentioned = matchConnectedToolkitsInText(scopeText, connected);
+    if (mentioned.length === 0) return route;
+    const composioToolkits = [...new Set([...route.composioToolkits, ...mentioned])];
+    return {
+      ...route,
+      composioToolkits,
+      reason: 'matched',
+    };
+  } catch (err) {
+    logger.debug({ err }, 'Connected Composio toolkit text match failed (non-fatal)');
+    return route;
+  }
 }
 
 /**
@@ -117,13 +141,17 @@ export async function buildExtraMcpForRunAgent(
     };
   }
 
+  const profileComposioAllowList = (opts.profile as { allowedComposioToolkits?: string[] } | null | undefined)?.allowedComposioToolkits;
+  if (!Array.isArray(profileComposioAllowList)) {
+    route = await widenRouteWithMentionedComposioToolkits(route, opts.scopeText);
+  }
+
   // 2. Build Composio MCP servers, honoring profile allowlist when set.
   let composioMcpServers: Record<string, Record<string, unknown>> = {};
   try {
     const { buildComposioMcpServers } = await import('../integrations/composio/mcp-bridge.js');
-    const profileAllowList = (opts.profile as { allowedComposioToolkits?: string[] } | null | undefined)?.allowedComposioToolkits;
-    const composioAllow = Array.isArray(profileAllowList)
-      ? profileAllowList
+    const composioAllow = Array.isArray(profileComposioAllowList)
+      ? profileComposioAllowList
       : route.composioToolkits;
     composioMcpServers = await buildComposioMcpServers(composioAllow) as Record<string, Record<string, unknown>>;
   } catch (err) {

@@ -202,25 +202,25 @@ describe('listSkills — agent-scoped precedence', () => {
   it('agent-scoped skills shadow global skills with the same name', async () => {
     const { listSkills, getSkill } = await import('../src/agent/skill-store.js');
     writeFolderSkill('audit', ANTHROPIC_FRONTMATTER.replace('Extracts text from PDFs', 'GLOBAL VERSION'));
-    const agentDir = path.join(tmpHome, 'vault', '00-System', 'agents', 'sasha', 'skills');
+    const agentDir = path.join(tmpHome, 'vault', '00-System', 'agents', 'morgan', 'skills');
     writeFolderSkill('audit', ANTHROPIC_FRONTMATTER.replace('Extracts text from PDFs', 'AGENT VERSION'), agentDir);
 
-    const skills = listSkills({ agentSlug: 'sasha' });
+    const skills = listSkills({ agentSlug: 'morgan' });
     expect(skills).toHaveLength(1);
     expect(skills[0].scope).toBe('agent');
     expect(skills[0].frontmatter.description).toContain('AGENT');
-    expect(getSkill('audit', { agentSlug: 'sasha' })?.scope).toBe('agent');
+    expect(getSkill('audit', { agentSlug: 'morgan' })?.scope).toBe('agent');
   });
 
   it('project skills still shadow agent-scoped skills', async () => {
     const { getSkill } = await import('../src/agent/skill-store.js');
-    const agentDir = path.join(tmpHome, 'vault', '00-System', 'agents', 'sasha', 'skills');
+    const agentDir = path.join(tmpHome, 'vault', '00-System', 'agents', 'morgan', 'skills');
     writeFolderSkill('audit', ANTHROPIC_FRONTMATTER.replace('Extracts text from PDFs', 'AGENT VERSION'), agentDir);
     const projectDir = path.join(tmpHome, 'projectA');
     writeFolderSkill('audit', ANTHROPIC_FRONTMATTER.replace('Extracts text from PDFs', 'PROJECT VERSION'),
       path.join(projectDir, '.clementine', 'skills'));
 
-    const skill = getSkill('audit', { agentSlug: 'sasha', projectWorkDir: projectDir });
+    const skill = getSkill('audit', { agentSlug: 'morgan', projectWorkDir: projectDir });
     expect(skill?.scope).toBe('project');
     expect(skill?.frontmatter.description).toContain('PROJECT');
   });
@@ -810,9 +810,9 @@ describe('cleanupLegacySkillBackups (1.18.125 — vault janitor)', () => {
 
   it('also sweeps per-agent skill dirs (00-System/agents/<slug>/skills/)', async () => {
     const { cleanupLegacySkillBackups } = await import('../src/agent/skill-store.js');
-    const agentDir = path.join(tmpHome, 'vault', '00-System', 'agents', 'sasha', 'skills');
+    const agentDir = path.join(tmpHome, 'vault', '00-System', 'agents', 'morgan', 'skills');
     mkdirSync(agentDir, { recursive: true });
-    const oldBak = path.join(agentDir, 'sasha-old.md.bak');
+    const oldBak = path.join(agentDir, 'morgan-old.md.bak');
     writeFileSync(oldBak, '# old');
     setMtimeDaysAgo(oldBak, 90);
     const r = cleanupLegacySkillBackups();

@@ -12,7 +12,7 @@
  *
  *   {
  *     "global": ["my-buggy-skill", "stale-procedure"],
- *     "ross-the-sdr": ["sasha-only-skill"]
+ *     "sales-agent": ["morgan-only-skill"]
  *   }
  *
  * Merged with the auto-suppression set inside `buildSkillContext` so

@@ -24,8 +24,8 @@ import {
   renameSync,
   writeFileSync,
 } from 'node:fs';
+import { createRequire } from 'node:module';
 import path from 'node:path';
-import Database from 'better-sqlite3';
 import pino from 'pino';
 
 import { BASE_DIR, MEMORY_DB_PATH } from '../config.js';
@@ -34,6 +34,15 @@ import { logAuditJsonl } from '../agent/hooks.js';
 import { classifyRunHealth, isRunHealthFailure } from './job-health.js';
 
 const logger = pino({ name: 'clementine.failure-monitor' });
+const require = createRequire(import.meta.url);
+
+type DatabaseConstructor = typeof import('better-sqlite3');
+let Database: DatabaseConstructor | null = null;
+
+function getDatabaseConstructor(): DatabaseConstructor {
+  Database ??= require('better-sqlite3') as DatabaseConstructor;
+  return Database;
+}
 
 const RUNS_DIR = path.join(BASE_DIR, 'cron', 'runs');
 const ADVISOR_EVENTS_FILE = path.join(BASE_DIR, 'cron', 'advisor-events.jsonl');
@@ -137,7 +146,8 @@ function loadGradeCache(): Map<string, boolean> {
   const cache = new Map<string, boolean>();
   try {
     if (!existsSync(MEMORY_DB_PATH)) return cache;
-    const db = new Database(MEMORY_DB_PATH, { readonly: true });
+    const DatabaseCtor = getDatabaseConstructor();
+    const db = new DatabaseCtor(MEMORY_DB_PATH, { readonly: true });
     try {
       const rows = db.prepare(
         `SELECT job_name, started_at, passed FROM graded_runs

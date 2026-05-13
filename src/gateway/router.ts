@@ -34,6 +34,7 @@ import { TeamRouter } from '../agent/team-router.js';
 import { TeamBus } from '../agent/team-bus.js';
 import type { NotificationDispatcher } from './notifications.js';
 import { createBackgroundTask, listBackgroundTasks, loadBackgroundTask, markFailed, resumeBackgroundTask } from '../agent/background-tasks.js';
+import { defaultPermissionModeForLane } from '../agent/execution-policy.js';
 import { applyAssistantExperienceUpdate, detectApprovalReply, detectLocalTurn, type AssistantExperienceUpdate } from '../agent/local-turn.js';
 import { buildApprovalFollowupPrompt, detectActionExpectation } from '../agent/action-enforcer.js';
 import { updateClementineJson } from '../config/clementine-json.js';
@@ -57,6 +58,12 @@ import { buildActiveContextSnapshot } from './active-context.js';
 import { markContextEventBySource } from './context-events.js';
 import { EventLog } from './event-log.js';
 import { detectComplexTaskForBackground, type ComplexTaskRecommendation } from '../agent/complex-task-detector.js';
+import {
+  buildAgentDecisionContinuationPrompt,
+  buildBlockedActionDecisionFromRunSummary,
+  parseAgentDecisionReply,
+  type PendingAgentDecision,
+} from '../agent/clarification-gate.js';
 
 export { isLiveUnleashedStatus } from './unleashed-status.js';
 
@@ -91,6 +98,7 @@ type TranscriptSearchRow = {
 };
 
 type RecallMode = 'semantic' | 'lexical' | 'both';
+type BusyInputMode = 'interrupt' | 'queue';
 
 type LedgerRunMetadata = {
   runId?: string;
@@ -192,6 +200,11 @@ function compactToolNames(names: string[]): string[] {
     out.push(name);
   }
   return out;
+}
+
+function parseBusyInputMode(value: string | undefined): BusyInputMode {
+  const normalized = (value ?? '').trim().toLowerCase();
+  return normalized === 'queue' ? 'queue' : 'interrupt';
 }
 
 function trimContextRecoveryText(text: string, maxChars: number): string {
@@ -349,6 +362,13 @@ interface SessionState {
     summarizedAt: number;
     originalRequest: string;
   };
+  /**
+   * Set when the agent reaches a concrete blocked state that needs one owner
+   * decision before continuing. Unlike generic approval prompts, this carries
+   * a resumable repair prompt so the next turn can pick up from the exact
+   * failed step instead of restarting discovery.
+   */
+  pendingAgentDecision?: PendingAgentDecision;
 }
 
 /** Map tool names to user-friendly progress labels for streaming indicators. */
@@ -743,8 +763,7 @@ export class Gateway {
     //
     // Plan mode is now OPT-IN, not auto-triggered by message shape.
     // Default chat behavior matches 1.18.62: the SDK query runs the
-    // work in one continuous Sonnet session, like Nora did on April
-    // 28-29 (38 Bash calls in one session — no decomposition needed).
+    // work in one continuous Sonnet session when decomposition is not needed.
     //
     // The planner-orchestrator remains available for genuinely huge
     // jobs, but the owner has to opt in:
@@ -822,7 +841,8 @@ export class Gateway {
 
   // Offer-message formatter was removed in the Saturday-feel restoration —
   // the chat path no longer asks "want me to run this in the background?".
-  // Auto-queue on explicit user intent is silent; everything else just runs.
+  // Auto-queue on explicit or clearly durable work is silent; everything else
+  // just runs.
 
   public acceptBackgroundOffer(sessionKey: string, id: string): { ok: boolean; response: string; task?: BackgroundTask } {
     const offer = this.getBackgroundOfferForSession(sessionKey, id);
@@ -1051,7 +1071,10 @@ export class Gateway {
       lines.push('Foreground chat work is currently running for this conversation.');
     }
     if (sess?.lock) {
-      lines.push('This chat session is busy. A new message will interrupt and redirect it.');
+      const mode = this.busyInputModeForSession(sessionKey);
+      lines.push(mode === 'queue'
+        ? 'This chat session is busy. New messages will wait and run next.'
+        : 'This chat session is busy. A new message will interrupt and redirect it.');
     }
     const seenBackgroundTasks = new Set<string>();
 
@@ -1991,10 +2014,13 @@ export class Gateway {
    */
   private async acquireSessionLock(sessionKey: string): Promise<() => void> {
     let s = this.getSession(sessionKey);
+    const busyInputMode = this.busyInputModeForSession(sessionKey);
 
     // If a query is in-flight, interrupt it rather than wait indefinitely.
     if (s.lock) {
-      if (s.abortController && !s.abortController.signal.aborted) {
+      if (busyInputMode === 'queue') {
+        logger.info({ sessionKey }, 'New message arrived while session was busy — queueing behind active run');
+      } else if (s.abortController && !s.abortController.signal.aborted) {
         const partial = s.lastStreamedText ?? '';
         s.pendingInterrupt = { partial, interruptedAt: Date.now() };
         s.suppressAbortResponseFor = s.abortController.signal;
@@ -2004,7 +2030,9 @@ export class Gateway {
         s.abortController.abort('interrupted-by-new-message');
       }
       // Drain any remaining lock promises (the aborted handler still needs to
-      // finish its finally block before we can proceed).
+      // finish its finally block before we can proceed). In queue mode this
+      // is the actual waiting behavior; in interrupt mode it waits only for
+      // cleanup after the abort signal.
       while (s.lock) {
         await s.lock;
         s = this.getSession(sessionKey);
@@ -2023,6 +2051,15 @@ export class Gateway {
       if (current) delete current.lock;
       releaseFn();
     };
+  }
+
+  private busyInputModeForSession(_sessionKey: string): BusyInputMode {
+    // Stage-2 groundwork: keep Clementine's current default behavior
+    // (interrupt) while allowing safer queue semantics for channels where
+    // repeated voice/chat messages should run sequentially instead of
+    // redirecting an active task. This intentionally stays process-level
+    // until the dashboard grows a per-channel setting.
+    return parseBusyInputMode(process.env.CLEMENTINE_BUSY_INPUT_MODE);
   }
 
   // ── Message handling ────────────────────────────────────────────────
@@ -2271,7 +2308,10 @@ export class Gateway {
         logger.debug({ err }, 'Commitment detection failed (non-fatal)');
       }
     }
-    const localResponse = await this.handleLocalTurn(sessionKey, text, onText, contextDecision);
+    const hasPendingAgentDecision = !!this.sessions.get(sessionKey)?.pendingAgentDecision;
+    const localResponse = hasPendingAgentDecision
+      ? null
+      : await this.handleLocalTurn(sessionKey, text, onText, contextDecision);
     if (localResponse !== null) {
       this.mirrorChatExchange(sessionKey, originalText, localResponse, { model: 'chat-local' });
       logger.info({
@@ -2284,7 +2324,9 @@ export class Gateway {
       return localResponse;
     }
 
-    const backgroundControl = this.resolveBackgroundOfferControl(sessionKey, text);
+    const backgroundControl = hasPendingAgentDecision
+      ? null
+      : this.resolveBackgroundOfferControl(sessionKey, text);
     if (backgroundControl?.response) {
       if (ledgerRunMetadata) {
         ledgerRunMetadata.executionMode = backgroundControl.executionMode;
@@ -2306,7 +2348,8 @@ export class Gateway {
       skipBackgroundOffer = true;
     }
 
-    const approvalFollowupExpected = this.isTrustedPersonalSession(sessionKey)
+    const approvalFollowupExpected = !hasPendingAgentDecision
+      && this.isTrustedPersonalSession(sessionKey)
       && detectApprovalReply(originalText) === true
       && this.hasRecentApprovalPrompt(sessionKey);
     if (approvalFollowupExpected) {
@@ -2314,9 +2357,10 @@ export class Gateway {
       logger.info({ sessionKey }, 'Approval follow-up promoted to tool-enabled action prompt');
     }
 
-    const recentContext: RecentOperationalContext | null = this.isTrustedPersonalSession(sessionKey)
-      ? resolveRecentOperationalContext(sessionKey, text, { baseDir: BASE_DIR })
-      : null;
+    const recentContext: RecentOperationalContext | null =
+      !hasPendingAgentDecision && this.isTrustedPersonalSession(sessionKey)
+        ? resolveRecentOperationalContext(sessionKey, text, { baseDir: BASE_DIR })
+        : null;
     if (recentContext) {
       logger.info({
         sessionKey,
@@ -2528,6 +2572,41 @@ export class Gateway {
         // chat-orchestrator default. Builder sessions still force Haiku below.
         const sess = this.sessions.get(sessionKey);
         const effectiveModel = model ?? sess?.model ?? MODELS.opus;
+        const pendingDecision = sess?.pendingAgentDecision;
+        if (pendingDecision && sess) {
+          if (Date.now() > pendingDecision.expiresAt) {
+            delete sess.pendingAgentDecision;
+            const response = 'That pending decision expired. Please send the request again and I will re-check the current state before acting.';
+            this.mirrorChatExchange(sessionKey, originalText, response, { model: 'chat-control' });
+            return response;
+          }
+
+          const decisionReply = parseAgentDecisionReply(pendingDecision, originalText);
+          if (decisionReply.kind === 'cancel') {
+            delete sess.pendingAgentDecision;
+            const response = 'OK, I will stop there. The completed discovery and local file changes stay in place.';
+            this.mirrorChatExchange(sessionKey, originalText, response, { model: 'chat-control' });
+            return response;
+          }
+          if (decisionReply.kind === 'unclear') {
+            const response = `${decisionReply.message}\n\n${pendingDecision.question}`;
+            this.mirrorChatExchange(sessionKey, originalText, response, { model: 'chat-control' });
+            return response;
+          }
+
+          const ownerClarification = originalText;
+          text = buildAgentDecisionContinuationPrompt(pendingDecision, decisionReply);
+          originalText = `${pendingDecision.originalRequest}\n\n[Owner clarification: ${ownerClarification}]`;
+          skipBackgroundOffer = true;
+          delete sess.pendingAgentDecision;
+          logger.info({
+            sessionKey,
+            decisionId: pendingDecision.id,
+            kind: pendingDecision.kind,
+            action: decisionReply.action,
+          }, 'Agentic decision gate: owner answered, resuming from blocked state');
+        }
+
         const pendingOverflow = sess?.pendingOverflowResume;
         if (pendingOverflow) {
           const ageMs = Date.now() - pendingOverflow.summarizedAt;
@@ -2586,14 +2665,14 @@ export class Gateway {
           || text.startsWith('[Reaction:')
           || text.startsWith('[System:');
 
-        // ── Explicit background-intent shortcut ────────────────────────
+        // ── Durable-work shortcut ───────────────────────────────────────
         // Chat normally runs in-place — the SDK auto-compacts and the model
         // can spawn `planner` / `researcher` subagents for context-heavy
-        // sub-steps, just like Claude Code. We only auto-queue a durable
-        // background task when the user *explicitly* says "in the
-        // background", "overnight", "keep working", "don't stop", etc. The
-        // post-overflow rescue path below still catches the rare case
-        // where chat actually drowns despite all that.
+        // sub-steps, just like Claude Code. We auto-queue a durable
+        // background task when the user explicitly asks OR when the request
+        // shape is clearly a long first pass (large batch + external systems
+        // + write/draft side effects). The post-overflow rescue path below
+        // still catches the rare case where chat drowns despite that.
         if (!skipBackgroundOffer && !isBuilderSession && !isInternalMsg && this.isTrustedPersonalSession(sessionKey)) {
           const recommendation = detectComplexTaskForBackground(text);
           if (recommendation) {
@@ -2609,7 +2688,7 @@ export class Gateway {
               taskId: task.id,
               reasons: recommendation.reasons,
               maxMinutes: recommendation.suggestedMaxMinutes,
-            }, 'Auto-queued background task on explicit user intent');
+            }, 'Auto-queued durable background task from chat');
             if (onText) {
               try { await onText(queued); } catch { /* channel streaming is best-effort */ }
             }
@@ -2866,15 +2945,14 @@ export class Gateway {
           // turn called `routeToolSurface(originalText)` and only loaded
           // MCP servers that matched THAT message's text. When the owner
           // sent a one-word reply like "sure" mid-conversation, zero MCPs
-          // matched → zero servers registered → Ross said "DataForSEO
+          // matched → zero servers registered → the hired agent said "DataForSEO
           // isn't in scope for this session context" mid-task. Verified
           // live on 2026-05-12 at 13:35:33.
           //
           // The right structural fix: chat always loads the agent's
           // full profile-allowed MCP surface. The profile's
           // `allowedComposioToolkits` / `allowedMcpServers` still bound
-          // what each agent can see (Ross gets his scope, Sasha gets
-          // hers). Within those bounds, every server registers every
+          // what each agent can see. Within those bounds, every server registers every
           // turn — tools don't vanish mid-conversation. The SDK's
           // `ENABLE_TOOL_SEARCH=auto:5` (execution-policy.ts) still
           // defers individual tool-schema loading until needed, so the
@@ -3017,14 +3095,17 @@ export class Gateway {
             // 1.18.184 — Chat runs on a trusted local machine for the
             // owner. The canonical SDK posture for that case is
             // `bypassPermissions` (requires allowDangerouslySkipPermissions,
-            // which execution-policy.ts:266 wires automatically when this
+            // which execution-policy.ts wires automatically when this
             // mode is selected). Builder sessions still inherit the
             // default 'dontAsk' since they have no tools and run on
             // Haiku — bypass would be a no-op there anyway. Autonomous
             // paths (cron, scheduled-skill, heartbeat) intentionally
             // stay on 'dontAsk' so they remain strict-allowlist for
             // safety; only the owner's direct chat gets full bypass.
-            ...(isBuilderSession ? {} : { permissionMode: 'bypassPermissions' as const }),
+            // Sourced from defaultPermissionModeForLane() so the lane
+            // policy is centralized and overridable by AutonomyProfile
+            // (Commit 4 in the orchestrator-first sequence).
+            ...(isBuilderSession ? {} : { permissionMode: defaultPermissionModeForLane('chat') }),
             ...(builderModel ? { model: builderModel } : {}),
             // 1.18.184 — right-size maxTurns for chat-initiated work.
             // Chat jobs are often multi-step ("draft 3 emails and send
@@ -3073,8 +3154,8 @@ export class Gateway {
           // chat. When we resume one of those, the SDK tries to load the
           // entire accumulated JSONL into context — easily blows past
           // 200K tokens on the very first user message after a daemon
-          // start. Zach hit this on a freshly-installed 1.18.195 because
-          // his topshelfbot session had months of history.
+          // start. Long-lived installs can accumulate months of chat
+          // history in one provider session.
           //
           // The fix is the same thing any human would do: throw the
           // resume away, start a fresh SDK session, send the same user
@@ -3242,37 +3323,44 @@ export class Gateway {
               applyOneMillionContextRecovery();
               this.clearSession(effectiveSessionKey);
               return oneMillionContextRecoveryMessage();
-	            case 'context_overflow': {
-	              // 1.18.200 — if a run overflowed after side-effect tools
-	              // fired, do not pretend "nothing happened." The SDK session
-	              // may be reset, but Clementine's event log still records
-	              // every tool_call/tool_result by runId. Summarize those
-	              // effects, stash a short-lived resume token, and let the
-	              // owner say "continue" to restart from the factual state.
-	              logger.info({ sessionKey }, 'Context overflow — autocompact ceiling reached, resetting');
-	              this.assistant.clearSession(effectiveSessionKey);
-	              let response = contextOverflowFallbackMessage();
-	              const runIds = runIdsFromMetadata(ledgerRunMetadata);
-	              if (runIds.length > 0) {
-	                try {
-	                  const { summarizeRunSideEffects, hasOperationalActivity, formatOverflowRecoveryMessage } = await import('../agent/run-summary.js');
-	                  const summary = summarizeRunSideEffects(runIds);
-	                  if (hasOperationalActivity(summary)) {
-	                    const state = this.getSession(sessionKey);
-	                    state.pendingOverflowResume = {
-	                      runIds,
-	                      summarizedAt: Date.now(),
-	                      originalRequest: originalText,
-	                    };
-	                    response = formatOverflowRecoveryMessage(summary);
-	                  }
-	                } catch (summaryErr) {
-	                  logger.warn({ summaryErr, sessionKey, runIds }, 'Context overflow side-effect summary failed');
-	                }
-	              }
-	              this.mirrorChatExchange(sessionKey, originalText, response, { model: 'chat-control' });
-	              return response;
-	            }
+            case 'context_overflow': {
+              // 1.18.200 — if a run overflowed after side-effect tools
+              // fired, do not pretend "nothing happened." The SDK session
+              // may be reset, but Clementine's event log still records
+              // every tool_call/tool_result by runId. Summarize those
+              // effects, stash a short-lived resume token, and let the
+              // owner say "continue" to restart from the factual state.
+              logger.info({ sessionKey }, 'Context overflow — autocompact ceiling reached, resetting');
+              this.assistant.clearSession(effectiveSessionKey);
+              let response = contextOverflowFallbackMessage();
+              const runIds = runIdsFromMetadata(ledgerRunMetadata);
+              if (runIds.length > 0) {
+                try {
+                  const { summarizeRunSideEffects, hasOperationalActivity, formatOverflowRecoveryMessage } = await import('../agent/run-summary.js');
+                  const summary = summarizeRunSideEffects(runIds);
+                  if (hasOperationalActivity(summary)) {
+                    const state = this.getSession(sessionKey);
+                    const repairDecision = buildBlockedActionDecisionFromRunSummary(summary, originalText);
+                    if (repairDecision) {
+                      state.pendingAgentDecision = repairDecision;
+                      delete state.pendingOverflowResume;
+                      response = repairDecision.question;
+                    } else {
+                      state.pendingOverflowResume = {
+                        runIds,
+                        summarizedAt: Date.now(),
+                        originalRequest: originalText,
+                      };
+                      response = formatOverflowRecoveryMessage(summary);
+                    }
+                  }
+                } catch (summaryErr) {
+                  logger.warn({ summaryErr, sessionKey, runIds }, 'Context overflow side-effect summary failed');
+                }
+              }
+              this.mirrorChatExchange(sessionKey, originalText, response, { model: 'chat-control' });
+              return response;
+            }
             case 'auth':
               this.recordAuthFailure();
               return "I'm temporarily offline due to an authentication issue. The owner needs to re-authenticate — I'll recover automatically once it's resolved.";

@@ -36,7 +36,7 @@ import pino from 'pino';
 import type { AgentProfile } from '../types.js';
 import type { Gateway } from '../gateway/router.js';
 import type { CronScheduler } from '../gateway/cron-scheduler.js';
-import { chunkText, DiscordStreamingMessage, sanitizeResponse, rehydrateStatusEmbed, setSavedStatusEmbed } from './discord-utils.js';
+import { buildDiscordMessageText, chunkText, DiscordStreamingMessage, sanitizeResponse, rehydrateStatusEmbed, setSavedStatusEmbed } from './discord-utils.js';
 import { MODELS } from '../config.js';
 import * as cronParser from 'cron-parser';
 
@@ -862,17 +862,7 @@ export class AgentBotClient {
       return;
     }
 
-    // Extract attachments
-    let text = message.content;
-    if (message.attachments.size > 0) {
-      const attachmentLines = message.attachments.map(att => {
-        if (att.contentType?.startsWith('image/')) {
-          return `[Image attached: ${att.name} (${att.url})]`;
-        }
-        return `[File attached: ${att.name}, ${att.contentType || 'unknown type'}, ${att.url}]`;
-      });
-      text = attachmentLines.join('\n') + (text ? '\n' + text : '');
-    }
+    let text = buildDiscordMessageText(message);
 
     if (!text) return;
 

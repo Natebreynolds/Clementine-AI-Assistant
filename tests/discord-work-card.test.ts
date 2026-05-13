@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
+import { Collection } from 'discord.js';
 import {
+  buildDiscordMessageText,
   buildDiscordWorkCard,
   classifyDiscordWorkActivity,
   type DiscordWorkCardState,
@@ -72,5 +74,30 @@ describe('Discord live work card', () => {
     expect(classifyDiscordWorkActivity('Read')).toBe('read');
     expect(classifyDiscordWorkActivity('mcp__composio__OUTLOOK_SEND_EMAIL')).toBe('external');
     expect(classifyDiscordWorkActivity('mcp__clementine-tools__memory_search')).toBe('memory');
+  });
+
+  it('normalizes text and attachments with name, type, size, and URL', () => {
+    const attachments = new Collection<string, any>();
+    attachments.set('img', {
+      name: 'coach board.png',
+      contentType: 'image/png',
+      size: 2048,
+      url: 'https://cdn.discordapp.com/attachments/1/coach-board.png',
+    });
+    attachments.set('csv', {
+      name: 'prospects.csv',
+      contentType: 'text/csv',
+      size: 1536,
+      url: 'https://cdn.discordapp.com/attachments/1/prospects.csv',
+    });
+
+    const text = buildDiscordMessageText({
+      content: 'Please review these.',
+      attachments,
+    } as any);
+
+    expect(text).toContain('[Image attached: coach board.png; type=image/png; size=2 KB; url=https://cdn.discordapp.com/attachments/1/coach-board.png]');
+    expect(text).toContain('[File attached: prospects.csv; type=text/csv; size=2 KB; url=https://cdn.discordapp.com/attachments/1/prospects.csv]');
+    expect(text.endsWith('Please review these.')).toBe(true);
   });
 });

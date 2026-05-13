@@ -36,15 +36,15 @@ describe('classifyMessageShape — simple', () => {
 });
 
 describe('classifyMessageShape — multi-step', () => {
-  it('Zach-style "find X, build Y, deploy Z" = multi-step', () => {
+  it('"find X, build Y, deploy Z" = multi-step', () => {
     const result = classifyMessageShape(
-      "the coaches project I want to build an HTML report for is in my Downloads folder. Find it, link it as a Clementine project, then build me a single index.html in its output/ folder showing all 100 coaches with search/filter/sort. After that, set up a netlify deploy.json for it and deploy. Only tell me 'done' once you've curled the live URL and gotten HTTP 200.",
+      "the product site project I want to build an HTML report for is in my Downloads folder. Find it, link it as a Clementine project, then build me a single index.html in its output/ folder with search/filter/sort. After that, set up a netlify deploy.json for it and deploy. Only tell me 'done' once you've curled the live URL and gotten HTTP 200.",
     );
     expect(result.shape).toBe('multi-step');
     expect(result.score).toBeGreaterThanOrEqual(3);
   });
 
-  it('Nora-style "send 25 emails after scraping" = multi-step', () => {
+  it('"send 25 emails after scraping" = multi-step', () => {
     const result = classifyMessageShape(
       'send 25 salesforce emails after you scrape them with data for seo find their info in salesforce',
     );
@@ -171,10 +171,10 @@ describe('detectPlanApproval', () => {
 
 describe('detectPlanModeRequest (1.18.193 — opt-in plan mode)', () => {
   it('triggers on /plan prefix', () => {
-    const result = detectPlanModeRequest('/plan build me a coaches HTML report');
+    const result = detectPlanModeRequest('/plan build me a catalog HTML report');
     expect(result.requested).toBe(true);
     if (result.requested) {
-      expect(result.cleaned).toBe('build me a coaches HTML report');
+      expect(result.cleaned).toBe('build me a catalog HTML report');
     }
   });
 
@@ -192,18 +192,18 @@ describe('detectPlanModeRequest (1.18.193 — opt-in plan mode)', () => {
   });
 
   it('triggers on [plan-mode] token anywhere', () => {
-    const result = detectPlanModeRequest('Build me a report [plan-mode] for the coaches');
+    const result = detectPlanModeRequest('Build me a report [plan-mode] for the catalog');
     expect(result.requested).toBe(true);
     if (result.requested) {
       // Token stripped, surrounding text preserved
       expect(result.cleaned).toContain('Build me a report');
-      expect(result.cleaned).toContain('for the coaches');
+      expect(result.cleaned).toContain('for the catalog');
       expect(result.cleaned).not.toContain('[plan-mode]');
     }
   });
 
   it('does NOT trigger on multi-step language without explicit opt-in', () => {
-    // This is Nora's April 28-29 vibe — multi-step but no explicit /plan.
+    // Multi-step, but no explicit /plan.
     // Should fall through to normal chat (Sonnet just runs it).
     expect(detectPlanModeRequest('lets knock out touch 4 for legalweek').requested).toBe(false);
     expect(detectPlanModeRequest('pull contacts from salesforce, send via gmail').requested).toBe(false);

@@ -54,8 +54,8 @@ export interface ScheduleEntry {
   /** When false the scheduler skips it. Lets users pause without losing
    *  the schedule definition. */
   enabled: boolean;
-  /** When set, the skill runs as the named hired agent (Sasha, Ross,
-   *  Nora, etc.). null/undefined = Clementine. Per-agent skills load
+  /** When set, the skill runs as the named hired agent.
+   *  null/undefined = Clementine. Per-agent skills load
    *  from `agents/<slug>/skills/` first; the runtime resolves precedence. */
   agentSlug?: string | null;
   /** ISO timestamp of when the schedule was first created. */

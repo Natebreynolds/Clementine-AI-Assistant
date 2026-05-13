@@ -87,12 +87,12 @@ describe('side-effect idempotency guard', () => {
       const a = buildSideEffectFingerprint('mcp__gmail__GMAIL_SEND_EMAIL', {
         to: 'kevin@example.com',
         subject: 'Denver Legal Search',
-        body: 'Hi Kevin,\n\nBest,\nRoss',
+        body: 'Hi Kevin,\n\nBest,\nAlex',
       });
       const b = buildSideEffectFingerprint('mcp__gmail__GMAIL_SEND_EMAIL', {
         to: 'KEVIN@example.com',
         subject: 'denver legal search',
-        body: 'Hi   Kevin, Best, Ross',
+        body: 'Hi   Kevin, Best, Alex',
       });
 
       expect(b?.fingerprint).toBe(a?.fingerprint);

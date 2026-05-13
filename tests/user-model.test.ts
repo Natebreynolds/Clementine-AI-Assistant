@@ -55,9 +55,9 @@ describe('user_model_blocks schema', () => {
 
 describe('CRUD on slots', () => {
   it('reads back a freshly written slot', () => {
-    store.setUserModelBlock({ slot: 'user_facts', content: 'Nathan is a coach' });
+    store.setUserModelBlock({ slot: 'user_facts', content: 'Owner is a coach' });
     const block = store.getUserModelBlock('user_facts');
-    expect(block?.content).toBe('Nathan is a coach');
+    expect(block?.content).toBe('Owner is a coach');
     expect(block?.charLimit).toBe(2000);
     expect(block?.agentSlug).toBeNull();
   });
@@ -153,7 +153,7 @@ describe('renderUserModel formatting', () => {
 
   it('emits sections in canonical order with friendly labels', () => {
     store.setUserModelBlock({ slot: 'goals', content: 'ship the memory feature' });
-    store.setUserModelBlock({ slot: 'user_facts', content: 'name: Nathan' });
+    store.setUserModelBlock({ slot: 'user_facts', content: 'name: Owner' });
     const out = store.renderUserModel();
     // user_facts comes before goals per USER_MODEL_SLOTS order
     const userFactsIdx = out.indexOf('User Facts');
@@ -175,7 +175,7 @@ describe('renderUserModel formatting', () => {
 
 describe('context-assembler integration', () => {
   it('places user model at priority -1 above identity', async () => {
-    store.setUserModelBlock({ slot: 'user_facts', content: 'Nathan prefers terse responses' });
+    store.setUserModelBlock({ slot: 'user_facts', content: 'Owner prefers terse responses' });
     const block = store.renderUserModel();
     const result = await assembleContext({
       totalBudget: 10000,
@@ -183,7 +183,7 @@ describe('context-assembler integration', () => {
       identityPath: null,
     });
     expect(result.text).toContain('User Facts');
-    expect(result.text).toContain('Nathan prefers terse responses');
+    expect(result.text).toContain('Owner prefers terse responses');
     expect(result.slotsIncluded).toContain('user-model');
   });
 

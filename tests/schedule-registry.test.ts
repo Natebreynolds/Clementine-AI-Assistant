@@ -38,7 +38,7 @@ describe('listSchedules', () => {
   it('flattens the on-disk shape into ScheduleEntry[] with skillName', async () => {
     writeFileSync(fileAt(), JSON.stringify({
       'morning-briefing': { schedule: '0 7 * * 1-5', enabled: true, agentSlug: null },
-      'weekly-review': { schedule: '0 17 * * 5', enabled: false, agentSlug: 'sasha-the-cmo' },
+      'weekly-review': { schedule: '0 17 * * 5', enabled: false, agentSlug: 'marketing-agent' },
     }));
     const { listSchedules } = await import('../src/agent/schedule-registry.js');
     const result = listSchedules();
@@ -48,7 +48,7 @@ describe('listSchedules', () => {
     expect(morning?.enabled).toBe(true);
     const weekly = result.find(e => e.skillName === 'weekly-review');
     expect(weekly?.enabled).toBe(false);
-    expect(weekly?.agentSlug).toBe('sasha-the-cmo');
+    expect(weekly?.agentSlug).toBe('marketing-agent');
   });
 
   it('survives a malformed JSON file (returns empty array)', async () => {
@@ -106,14 +106,14 @@ describe('getSchedule', () => {
 
   it('returns the entry with skillName populated', async () => {
     writeFileSync(fileAt(), JSON.stringify({
-      'cold-outreach': { schedule: '0 8 * * 1-5', enabled: true, agentSlug: 'ross-the-sdr' },
+      'cold-outreach': { schedule: '0 8 * * 1-5', enabled: true, agentSlug: 'sales-agent' },
     }));
     const { getSchedule } = await import('../src/agent/schedule-registry.js');
     const r = getSchedule('cold-outreach');
     expect(r).not.toBeNull();
     expect(r!.skillName).toBe('cold-outreach');
     expect(r!.schedule).toBe('0 8 * * 1-5');
-    expect(r!.agentSlug).toBe('ross-the-sdr');
+    expect(r!.agentSlug).toBe('sales-agent');
   });
 });
 
@@ -149,9 +149,9 @@ describe('setSchedule', () => {
 
   it('persists agentSlug for hired-agent skills', async () => {
     const { setSchedule, getSchedule } = await import('../src/agent/schedule-registry.js');
-    setSchedule('skill-of-sasha', { schedule: '0 14 * * *', agentSlug: 'sasha-the-cmo' });
-    const r = getSchedule('skill-of-sasha');
-    expect(r?.agentSlug).toBe('sasha-the-cmo');
+    setSchedule('skill-of-morgan', { schedule: '0 14 * * *', agentSlug: 'marketing-agent' });
+    const r = getSchedule('skill-of-morgan');
+    expect(r?.agentSlug).toBe('marketing-agent');
   });
 
   it('persists multiple entries on disk in sorted-key order', async () => {
@@ -190,12 +190,12 @@ describe('removeSchedule', () => {
 describe('enableSchedule', () => {
   it('flips the enabled flag without touching schedule or agentSlug', async () => {
     const { setSchedule, enableSchedule, getSchedule } = await import('../src/agent/schedule-registry.js');
-    setSchedule('toggle-me', { schedule: '0 9 * * *', agentSlug: 'ross-the-sdr', enabled: true });
+    setSchedule('toggle-me', { schedule: '0 9 * * *', agentSlug: 'sales-agent', enabled: true });
     const r = enableSchedule('toggle-me', false);
     expect(r?.enabled).toBe(false);
     const fresh = getSchedule('toggle-me');
     expect(fresh?.schedule).toBe('0 9 * * *');
-    expect(fresh?.agentSlug).toBe('ross-the-sdr');
+    expect(fresh?.agentSlug).toBe('sales-agent');
     expect(fresh?.enabled).toBe(false);
   });
 

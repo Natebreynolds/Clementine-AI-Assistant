@@ -33,15 +33,15 @@ describe('webhook-actions matcher', () => {
     const rule: WebhookActionRule = {
       do: 'wake_agent',
       agent: 'a',
-      match: { 'pull_request.state': 'open', 'sender.login': 'natebreynolds' },
+      match: { 'pull_request.state': 'open', 'sender.login': 'example-user' },
     };
     expect(ruleMatches(rule, {
       pull_request: { state: 'open' },
-      sender: { login: 'natebreynolds' },
+      sender: { login: 'example-user' },
     })).toBe(true);
     expect(ruleMatches(rule, {
       pull_request: { state: 'closed' },
-      sender: { login: 'natebreynolds' },
+      sender: { login: 'example-user' },
     })).toBe(false);
   });
 
@@ -78,7 +78,7 @@ describe('webhook-actions matcher', () => {
 
 describe('webhook-actions template renderer', () => {
   it('substitutes {{ field }} from payload', () => {
-    expect(renderTemplate('Hello {{ name }}', { name: 'Ross' })).toBe('Hello Ross');
+    expect(renderTemplate('Hello {{ name }}', { name: 'Alex' })).toBe('Hello Alex');
   });
 
   it('handles dot-path interpolation', () => {
@@ -126,7 +126,7 @@ describe('webhook-actions dispatch', () => {
               {
                 match: { action: 'opened', pull_request: '*' },
                 do: 'wake_agent',
-                agent: 'ross-the-sdr',
+                agent: 'sales-agent',
                 reason: 'PR #{{ pull_request.number }} opened by {{ sender.login }}',
               },
             ],
@@ -140,7 +140,7 @@ describe('webhook-actions dispatch', () => {
       {
         action: 'opened',
         pull_request: { number: 7, title: 'Add thing' },
-        sender: { login: 'natebreynolds' },
+        sender: { login: 'example-user' },
       },
       { configPath, baseDir },
     );
@@ -149,12 +149,12 @@ describe('webhook-actions dispatch', () => {
     expect(result.dispatched).toBe(1);
     expect(result.errors).toEqual([]);
 
-    const sentinel = path.join(baseDir, 'heartbeat', 'wake', 'ross-the-sdr.json');
+    const sentinel = path.join(baseDir, 'heartbeat', 'wake', 'sales-agent.json');
     expect(existsSync(sentinel)).toBe(true);
     const written = JSON.parse(readFileSync(sentinel, 'utf-8'));
-    expect(written.targetSlug).toBe('ross-the-sdr');
+    expect(written.targetSlug).toBe('sales-agent');
     expect(written.fromSlug).toBe('webhook:github');
-    expect(written.reason).toBe('PR #7 opened by natebreynolds');
+    expect(written.reason).toBe('PR #7 opened by example-user');
   });
 
   it('dispatches start_background_task by creating a task with rendered prompt', () => {
@@ -169,7 +169,7 @@ describe('webhook-actions dispatch', () => {
               {
                 match: { event: 'opportunity_updated' },
                 do: 'start_background_task',
-                agent: 'sasha-the-cmo',
+                agent: 'marketing-agent',
                 prompt: 'Opportunity {{ Opportunity.Name }} changed (stage: {{ Opportunity.StageName }}). Refresh the brief.',
                 maxMinutes: 45,
               },
@@ -195,7 +195,7 @@ describe('webhook-actions dispatch', () => {
     const files = readdirSync(bgDir).filter((f: string) => f.endsWith('.json'));
     expect(files.length).toBe(1);
     const task = JSON.parse(readFileSync(path.join(bgDir, files[0]), 'utf-8'));
-    expect(task.fromAgent).toBe('sasha-the-cmo');
+    expect(task.fromAgent).toBe('marketing-agent');
     expect(task.prompt).toBe('Opportunity Acme Renewal changed (stage: Negotiation). Refresh the brief.');
     expect(task.maxMinutes).toBe(45);
     expect(task.status).toBe('pending');
@@ -240,7 +240,7 @@ describe('webhook-actions dispatch', () => {
           {
             source: 'x',
             secret: 'test',
-            on: [{ do: 'start_background_task', agent: 'sasha' }],
+            on: [{ do: 'start_background_task', agent: 'morgan' }],
           },
         ],
       }),

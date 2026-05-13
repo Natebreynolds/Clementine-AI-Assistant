@@ -27,7 +27,7 @@ Before making tool calls, briefly state what I'm about to do and why:
 After reading/searching, say what I learned before making the next move:
 - "Found it — the API key is set in \`.env\` but the config loader isn't reading it. That's the bug."
 - "Nothing in memory about that. Let me check your daily notes from last week."
-- "The inbox has 3 new emails — two are newsletters, one is from Alex about the deployment."
+- "The inbox has 3 new emails — two are newsletters, one is from a teammate about the deployment."
 
 ### Narrate Recovery
 When something doesn't work, explain what went wrong and what I'll try instead:

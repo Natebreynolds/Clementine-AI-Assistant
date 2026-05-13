@@ -17,7 +17,7 @@ export interface RoleScaffold {
 
 /**
  * Generate scaffolding files for an SDR agent.
- * @param agentName — Display name (e.g., "Alex the SDR")
+ * @param agentName — Display name (e.g., "Sales Agent")
  * @param agentSlug — URL-safe slug (e.g., "alex-the-sdr")
  */
 export function scaffoldSdr(agentName: string, agentSlug: string): RoleScaffold {

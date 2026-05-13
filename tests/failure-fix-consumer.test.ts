@@ -109,7 +109,7 @@ describe('FailureFixConsumer.tick — end-to-end', () => {
 
   it('writes a safe cron-config proposal by default and DMs the owning agent', async () => {
     writeCronFile([
-      { name: 'market-leader-followup', schedule: '30 8 * * *', tier: 2, agentSlug: 'ross-the-sdr' },
+      { name: 'market-leader-followup', schedule: '30 8 * * *', tier: 2, agentSlug: 'sales-agent' },
     ]);
     writeTrigger('market-leader-followup', ['Reached maximum number of turns (8)']);
 
@@ -137,14 +137,14 @@ describe('FailureFixConsumer.tick — end-to-end', () => {
     // Agent was DM'd via their bot
     expect(send).toHaveBeenCalledTimes(1);
     const [text, ctx] = send.mock.calls[0];
-    expect(ctx?.agentSlug).toBe('ross-the-sdr');
+    expect(ctx?.agentSlug).toBe('sales-agent');
     expect(text).toMatch(/Fix proposal saved/);
     expect(text).toMatch(/market-leader-followup/);
   });
 
   it('can opt into auto-applying the unleashed fix', async () => {
     writeCronFile([
-      { name: 'market-leader-followup', schedule: '30 8 * * *', tier: 2, agentSlug: 'ross-the-sdr' },
+      { name: 'market-leader-followup', schedule: '30 8 * * *', tier: 2, agentSlug: 'sales-agent' },
     ]);
     writeTrigger('market-leader-followup', ['Reached maximum number of turns (8)']);
 
@@ -161,7 +161,7 @@ describe('FailureFixConsumer.tick — end-to-end', () => {
     expect(job.mode).toBe('unleashed');
     expect(job.max_hours).toBe(1);
     const [text, ctx] = send.mock.calls[0];
-    expect(ctx?.agentSlug).toBe('ross-the-sdr');
+    expect(ctx?.agentSlug).toBe('sales-agent');
     expect(text).toMatch(/Auto-fixed/);
   });
 
@@ -211,7 +211,7 @@ describe('FailureFixConsumer.tick — end-to-end', () => {
 
   it('writes a pending-change record + DMs agent for unknown patterns', async () => {
     writeCronFile([
-      { name: 'z', schedule: '* * * * *', agentSlug: 'sasha-the-cmo' },
+      { name: 'z', schedule: '* * * * *', agentSlug: 'marketing-agent' },
     ]);
     writeTrigger('z', ['Some weird error nobody has classified yet']);
 
@@ -225,7 +225,7 @@ describe('FailureFixConsumer.tick — end-to-end', () => {
     expect(proposals.length).toBe(1);
     const proposal = JSON.parse(readFileSync(path.join(pendingDir, proposals[0]), 'utf-8'));
     expect(proposal.jobName).toBe('z');
-    expect(proposal.agentSlug).toBe('sasha-the-cmo');
+    expect(proposal.agentSlug).toBe('marketing-agent');
     expect(proposal.category).toBe('unknown');
 
     // Trigger removed
@@ -234,7 +234,7 @@ describe('FailureFixConsumer.tick — end-to-end', () => {
     // Agent DM'd
     expect(send).toHaveBeenCalledTimes(1);
     const [, ctx] = send.mock.calls[0];
-    expect(ctx?.agentSlug).toBe('sasha-the-cmo');
+    expect(ctx?.agentSlug).toBe('marketing-agent');
   });
 
   it('handles malformed trigger JSON by removing it without crashing', async () => {
@@ -249,7 +249,7 @@ describe('FailureFixConsumer.tick — end-to-end', () => {
 
   it('event-driven: fires tick within debounce window when a trigger lands', async () => {
     writeCronFile([
-      { name: 'event-test', schedule: '* * * * *', agentSlug: 'ross-the-sdr' },
+      { name: 'event-test', schedule: '* * * * *', agentSlug: 'sales-agent' },
     ]);
     const send = vi.fn(async () => ({ delivered: true, channelErrors: {} }));
     // Use a large fallback tickMs so only the watch path can produce results
@@ -271,7 +271,7 @@ describe('FailureFixConsumer.tick — end-to-end', () => {
 
       expect(send).toHaveBeenCalled();
       const [text, ctx] = send.mock.calls[0];
-      expect(ctx?.agentSlug).toBe('ross-the-sdr');
+      expect(ctx?.agentSlug).toBe('sales-agent');
       expect(text).toMatch(/Fix proposal saved/);
     } finally {
       loop.stop();
@@ -283,20 +283,20 @@ describe('FailureFixConsumer.tick — end-to-end', () => {
     // agent-scoped CRON.md does. Trigger carries agentSlug + bareName.
     writeCronFile([]); // empty central
     const agentsDir = path.join(baseDir, 'agents');
-    mkdirSync(path.join(agentsDir, 'ross-the-sdr'), { recursive: true });
-    const agentCronPath = path.join(agentsDir, 'ross-the-sdr', 'CRON.md');
+    mkdirSync(path.join(agentsDir, 'sales-agent'), { recursive: true });
+    const agentCronPath = path.join(agentsDir, 'sales-agent', 'CRON.md');
     writeFileSync(
       agentCronPath,
-      matter.stringify('# Ross crons\n', {
+      matter.stringify('# Alex crons\n', {
         jobs: [{ name: 'tradeshow-outreach-am', schedule: '0 9 * * *', tier: 1 }],
       }),
     );
     writeFileSync(
-      path.join(triggersDir, 'ross-the-sdr_tradeshow-outreach-am.json'),
+      path.join(triggersDir, 'sales-agent_tradeshow-outreach-am.json'),
       JSON.stringify({
-        jobName: 'ross-the-sdr:tradeshow-outreach-am',
+        jobName: 'sales-agent:tradeshow-outreach-am',
         bareName: 'tradeshow-outreach-am',
-        agentSlug: 'ross-the-sdr',
+        agentSlug: 'sales-agent',
         consecutiveErrors: 5,
         recentErrors: ['Reached maximum number of turns (8)'],
         triggeredAt: new Date().toISOString(),
@@ -318,24 +318,24 @@ describe('FailureFixConsumer.tick — end-to-end', () => {
     expect(centralJobs.length).toBe(0);
     // DM routed to the agent
     const [text, ctx] = send.mock.calls[0];
-    expect(ctx?.agentSlug).toBe('ross-the-sdr');
-    expect(text).toMatch(/agents\/ross-the-sdr\/CRON\.md/);
+    expect(ctx?.agentSlug).toBe('sales-agent');
+    expect(text).toMatch(/agents\/sales-agent\/CRON\.md/);
   });
 
   it('recovers agent slug from prefixed jobName when older trigger lacks agentSlug field', async () => {
     writeCronFile([]);
     const agentsDir = path.join(baseDir, 'agents');
-    mkdirSync(path.join(agentsDir, 'sasha-the-cmo'), { recursive: true });
-    const agentCronPath = path.join(agentsDir, 'sasha-the-cmo', 'CRON.md');
+    mkdirSync(path.join(agentsDir, 'marketing-agent'), { recursive: true });
+    const agentCronPath = path.join(agentsDir, 'marketing-agent', 'CRON.md');
     writeFileSync(
       agentCronPath,
       matter.stringify('', { jobs: [{ name: 'weekly-content', schedule: '0 9 * * 1' }] }),
     );
     // Old-format trigger: no agentSlug, no bareName, but jobName is prefixed.
     writeFileSync(
-      path.join(triggersDir, 'sasha-the-cmo_weekly-content.json'),
+      path.join(triggersDir, 'marketing-agent_weekly-content.json'),
       JSON.stringify({
-        jobName: 'sasha-the-cmo:weekly-content',
+        jobName: 'marketing-agent:weekly-content',
         consecutiveErrors: 4,
         recentErrors: ['Autocompact is thrashing'],
         triggeredAt: new Date().toISOString(),
@@ -350,7 +350,7 @@ describe('FailureFixConsumer.tick — end-to-end', () => {
     const updated = matter(readFileSync(agentCronPath, 'utf-8'));
     expect((updated.data.jobs as Array<Record<string, unknown>>)[0].mode).toBe('unleashed');
     const [, ctx] = send.mock.calls[0];
-    expect(ctx?.agentSlug).toBe('sasha-the-cmo');
+    expect(ctx?.agentSlug).toBe('marketing-agent');
   });
 
   it('escalates as no-op when trigger names a job that no longer exists anywhere', async () => {
@@ -359,9 +359,9 @@ describe('FailureFixConsumer.tick — end-to-end', () => {
     writeFileSync(
       path.join(triggersDir, 'ghost.json'),
       JSON.stringify({
-        jobName: 'ross-the-sdr:deleted-job',
+        jobName: 'sales-agent:deleted-job',
         bareName: 'deleted-job',
-        agentSlug: 'ross-the-sdr',
+        agentSlug: 'sales-agent',
         consecutiveErrors: 3,
         recentErrors: ['Reached maximum number of turns (8)'],
         triggeredAt: new Date().toISOString(),
@@ -381,8 +381,8 @@ describe('FailureFixConsumer.tick — end-to-end', () => {
 
   it('processes multiple triggers in one tick', async () => {
     writeCronFile([
-      { name: 'a', agentSlug: 'ross-the-sdr' },
-      { name: 'b', agentSlug: 'sasha-the-cmo' },
+      { name: 'a', agentSlug: 'sales-agent' },
+      { name: 'b', agentSlug: 'marketing-agent' },
     ]);
     writeTrigger('a', ['Reached maximum number of turns (8)']);
     writeTrigger('b', ['Autocompact is thrashing']);

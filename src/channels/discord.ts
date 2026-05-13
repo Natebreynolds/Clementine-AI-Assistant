@@ -32,6 +32,7 @@ import path from 'node:path';
 import {
   chunkText,
   DiscordStreamingMessage,
+  buildDiscordMessageText,
   formatCronEmbed,
   rehydrateStatusEmbed,
   setSavedStatusEmbed,
@@ -859,17 +860,7 @@ export async function startDiscord(
       return;
     }
 
-    // Extract attachments (images and files)
-    let text = message.content;
-    if (message.attachments.size > 0) {
-      const attachmentLines = message.attachments.map(att => {
-        if (att.contentType?.startsWith('image/')) {
-          return `[Image attached: ${att.name} (${att.url})]`;
-        }
-        return `[File attached: ${att.name}, ${att.contentType || 'unknown type'}, ${att.url}]`;
-      });
-      text = attachmentLines.join('\n') + (text ? '\n' + text : '');
-    }
+    const text = buildDiscordMessageText(message);
 
     const sessionKey = isWatchedChannel
       ? `discord:channel:${message.channelId}:${message.author.id}`

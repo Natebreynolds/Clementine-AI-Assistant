@@ -161,15 +161,15 @@ function buildHiredAgentDescription(p: AgentProfile): string {
   ].filter(Boolean).join(' ');
 }
 
-/** Map a hired-agent profile to an AgentDefinition.
- *  Used when Clementine wants to delegate to Ross/Sasha/Nora etc. */
+/** Map a hired-agent profile to an AgentDefinition. */
 function profileToAgentDefinition(p: AgentProfile): AgentDefinition {
-  // Always include `Agent` so the subagent can further fan out, plus
-  // core read tools as a baseline. profile.team.allowedTools narrows
-  // beyond this when set.
-  const baseline = ['Agent', 'Read', 'Grep', 'Glob', 'WebSearch', 'WebFetch', 'TodoWrite'];
+  // Hired-agent definitions are leaf subagents by default. The Claude
+  // Agent SDK does not support recursive subagent spawning via `Agent`
+  // inside subagent tool lists; if Clementine grows nested orchestration,
+  // it should be explicit and depth-limited rather than accidental.
+  const baseline = ['Read', 'Grep', 'Glob', 'WebSearch', 'WebFetch', 'TodoWrite'];
   const tools = p.team?.allowedTools?.length
-    ? Array.from(new Set(['Agent', ...p.team.allowedTools]))
+    ? Array.from(new Set(p.team.allowedTools.filter(tool => tool !== 'Agent')))
     : baseline;
   return {
     description: buildHiredAgentDescription(p),
@@ -221,10 +221,10 @@ export function buildAgentMap(opts: BuildAgentMapOptions = {}): Record<string, A
   // 1.18.198 — NO `tools` allowlist. Researcher inherits every tool the
   // parent has access to (Bash, Read, MCP wildcards, etc.). The earlier
   // hardcoded ['Read', 'Grep', 'Glob', 'WebSearch', 'WebFetch'] blocked
-  // researcher from using the parent's MCP servers — when Ross dispatched
-  // "Parallel SEO enrichment for 13 domains" the subagent couldn't call
+  // researcher from using the parent's MCP servers. A delegated
+  // "Parallel SEO enrichment for 13 domains" subagent couldn't call
   // `mcp__dataforseo__*` because it wasn't in the allowlist. Result: the
-  // subagent said "I can't do that" and Ross fell back to running 25
+  // subagent said "I can't do that" and the parent fell back to running 25
   // sequential MCP calls in his own turn, defeating the fan-out.
   //
   // Read-only behavior is enforced in RESEARCHER_PROMPT (behavior class:

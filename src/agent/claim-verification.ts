@@ -5,7 +5,7 @@
  * Why this exists (1.18.187)
  * ──────────────────────────
  * On 2026-05-11 a bg task was diagnosed where Clementine said "The
- * site is live again at https://X.netlify.app — all 100 coaches with
+ * site is live again at https://X.netlify.app — all 100 product records with
  * search/filter/sort intact" — but the live URL returned HTTP 404,
  * and the run had zero tool calls matching a deploy. She had
  * confabulated success from a recall summary of a PRIOR task.

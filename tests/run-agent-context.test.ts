@@ -66,7 +66,7 @@ describe('buildChatSystemAppend — 1.18.184 behavioral posture', () => {
     // posture's cache position.
     fs.writeFileSync('/tmp/clementine-test-soul.md', 'I am Clementine.');
     fs.writeFileSync('/tmp/clementine-test-memory.md', 'Remember: cats > dogs.');
-    fs.writeFileSync('/tmp/clementine-test-agents.md', 'Team: Sasha, Otto.');
+    fs.writeFileSync('/tmp/clementine-test-agents.md', 'Team: Morgan, Otto.');
     const out = buildChatSystemAppend();
     const soulPos = out.indexOf('I am Clementine');
     const posturePos = out.indexOf('Trust posture');
@@ -97,7 +97,7 @@ describe('buildChatSystemAppend — 1.18.197 orchestrator posture', () => {
   });
 
   it('explicitly steers local file-system discovery to the discovery subagent', () => {
-    // This is the Zach case — "find that coach project locally" must
+    // "find that project locally" must
     // route to `discovery`, not a recursive Glob in the main turn.
     const out = buildChatSystemAppend();
     expect(out).toMatch(/find.*project.*locally|local discovery|file-system traversal/i);
@@ -115,7 +115,7 @@ describe('buildChatSystemAppend — 1.18.197 orchestrator posture', () => {
   });
 
   it('1.18.198 — orchestrator posture tells the parent to NAME the tool in dispatch prompts', () => {
-    // Verified failure mode from Ross run on 2026-05-12: parent dispatched
+    // Verified failure mode: parent dispatched
     // "Parallel SEO enrichment for 13 law firm domains" — vague. The
     // subagent inherited the parent's MCP tools but had no idea which
     // one to use, returned "I can't do this", and the parent fell back

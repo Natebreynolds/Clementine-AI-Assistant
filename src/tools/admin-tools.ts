@@ -2188,7 +2188,7 @@ server.tool(
   'apply_broken_job_fix',
   'Apply the cached auto-applicable fix for a broken cron job. Use this when the user explicitly asks to "fix" a job that has a confirmed diagnosis with autoApply=true and risk=low. Pass dryRun=true to preview without writing. Returns the applied operations, or refuses with a clear reason when the diagnosis is missing/risky/non-auto-applicable.',
   {
-    jobName: z.string().describe('The job name as shown in CRON.md or list_broken_jobs output (e.g. "audit-inbox-check" or "ross-the-sdr:reply-detection").'),
+    jobName: z.string().describe('The job name as shown in CRON.md or list_broken_jobs output (e.g. "audit-inbox-check" or "sales-agent:reply-detection").'),
     dryRun: z.boolean().optional().describe('If true, validate + show what would change but do not write. Default false.'),
   },
   async ({ jobName, dryRun }) => {
@@ -2240,7 +2240,7 @@ server.tool(
   'cron_diagnose',
   'Return a bounded deterministic diagnosis for one cron job — recent run summary, unleashed phase status, last clean success, current scalar config, and the inferred root cause. Reads only from local run history and cron config; does NOT execute the job. Use this when the user asks what is broken with a specific job, before deciding whether to call apply_broken_job_fix or to propose a manual repair.',
   {
-    jobName: z.string().describe('The job name as shown in CRON.md or list_broken_jobs output (e.g. "audit-inbox-check" or "ross-the-sdr:reply-detection").'),
+    jobName: z.string().describe('The job name as shown in CRON.md or list_broken_jobs output (e.g. "audit-inbox-check" or "sales-agent:reply-detection").'),
   },
   async ({ jobName }) => {
     const { buildCronDiagnosticResponseForRequest } = await import('../gateway/cron-diagnostic-turn.js');

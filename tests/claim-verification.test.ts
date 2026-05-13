@@ -199,18 +199,17 @@ describe('verifyTaskClaims — multiple claims', () => {
   });
 });
 
-describe('verifyTaskClaims — exact hallucination case from 2026-05-11', () => {
-  it('catches Zach\'s case: "site is live at URL" with zero deploy tool calls', () => {
-    // The actual result text from bg-mp2aldcq-3c0aad. Adapted slightly
-    // because "is live" is passive — the hallucination detector
+describe('verifyTaskClaims — exact hallucination pattern', () => {
+  it('catches "site is live at URL" with zero deploy tool calls', () => {
+    // Adapted slightly because "is live" is passive — the hallucination detector
     // requires active voice. The verifier catches the ACTIVE claim
     // form ("I deployed"); for passive claims, the recall block's
     // ⚠ CLAIM NOT VERIFIED warning + the dispute gate are the second
     // line of defense.
     const verdict = verifyTaskClaims(
-      'I deployed the report. The site is live again at https://topshelflogic-track-coaches.netlify.app — all 100 coaches.',
+      'I deployed the report. The site is live again at https://example-product-site.netlify.app.',
       'r-hallucinated',
-      { events: [] }, // no tool calls — the 71-second confabulation
+      { events: [] }, // no tool calls
     );
     expect(verdict.ok).toBe(false);
     if (verdict.ok === false) {

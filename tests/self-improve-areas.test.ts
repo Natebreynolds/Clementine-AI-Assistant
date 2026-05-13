@@ -72,7 +72,7 @@ describe('validateProposal — prompt-override', () => {
   });
 
   it('accepts agent:<slug>', () => {
-    const r = validateProposal('prompt-override', 'agent:ross-the-sdr', 'body');
+    const r = validateProposal('prompt-override', 'agent:sales-agent', 'body');
     expect(r.valid).toBe(true);
   });
 
@@ -100,7 +100,7 @@ describe('promptOverridePathForTarget', () => {
   });
 
   it('agent:<slug> → agents/<slug>.md', () => {
-    expect(promptOverridePathForTarget('agent:ross-the-sdr')).toMatch(/agents\/ross-the-sdr\.md$/);
+    expect(promptOverridePathForTarget('agent:sales-agent')).toMatch(/agents\/sales-agent\.md$/);
   });
 
   it('job:<jobName> → jobs/<jobName>.md', () => {
@@ -200,12 +200,12 @@ describe('self-improve plateau helpers', () => {
 describe('user model synthesis helpers', () => {
   it('normalizes only supported populated slots', () => {
     const slots = normalizeUserModelSlots({
-      user_facts: ' Nathan prefers concise updates ',
+      user_facts: ' Owner prefers concise updates ',
       goals: ['ship Clementine', 'reduce latency'],
       unsupported: 'ignore me',
       relationships: '',
     });
-    expect(slots.user_facts).toBe('Nathan prefers concise updates');
+    expect(slots.user_facts).toBe('Owner prefers concise updates');
     expect(slots.goals).toContain('- ship Clementine');
     expect(slots).not.toHaveProperty('unsupported');
     expect(slots.relationships).toBeUndefined();
@@ -213,7 +213,7 @@ describe('user model synthesis helpers', () => {
 
   it('builds a markdown artifact while keeping DB slots as source of truth', () => {
     const md = buildUserModelMarkdown('confidence_scores:\n  communication: 0.8', {
-      user_facts: 'Nathan is technical.',
+      user_facts: 'Owner is technical.',
       agent_persona: 'Be direct.',
     }, '2026-05-01T00:00:00.000Z');
     expect(md).toContain('last_updated: "2026-05-01T00:00:00.000Z"');

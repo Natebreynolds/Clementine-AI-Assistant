@@ -190,7 +190,7 @@ describe('parseCronJobs — trick capability fields', () => {
 
 describe('parseAgentCronJobs — symmetric trick capability handling', () => {
   it('parses capability fields on agent-scoped jobs and prefixes name with slug', () => {
-    writeAgentCron('ross-the-sdr',
+    writeAgentCron('sales-agent',
       `jobs:\n` +
       `  - name: prospect-research\n    schedule: "0 9 * * *"\n    prompt: research\n` +
       `    skills: [linkedin-recon]\n` +
@@ -201,8 +201,8 @@ describe('parseAgentCronJobs — symmetric trick capability handling', () => {
     const jobs = parseAgentCronJobs(TMP_AGENTS());
     expect(jobs).toHaveLength(1);
     expect(jobs[0]).toMatchObject({
-      name: 'ross-the-sdr:prospect-research',
-      agentSlug: 'ross-the-sdr',
+      name: 'sales-agent:prospect-research',
+      agentSlug: 'sales-agent',
       skills: ['linkedin-recon'],
       allowedTools: ['WebFetch', 'Read'],
       allowedMcpServers: ['salesforce'],

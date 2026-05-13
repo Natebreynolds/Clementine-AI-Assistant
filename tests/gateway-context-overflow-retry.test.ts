@@ -128,6 +128,7 @@ describe('gateway context overflow retry', () => {
     mocks.getEntityRegistry.mockReturnValue([]);
     mocks.findEntitiesInText.mockReturnValue([]);
     mocks.detectComplexTaskForBackground.mockReturnValue(null);
+    delete process.env.CLEMENTINE_BUSY_INPUT_MODE;
   });
 
   it('summarizes side effects across overflow retry runs and resumes from that state', async () => {
@@ -205,7 +206,7 @@ describe('gateway context overflow retry', () => {
 
     const response = await gateway.handleMessage(
       'discord:user:123',
-      'OK Ross can we fire off those emails now please',
+      'OK Alex can we fire off those emails now please',
     );
 
     expect(response).toContain('work had already happened');
@@ -224,12 +225,12 @@ describe('gateway context overflow retry', () => {
     expect(continuationPrompt).toContain('Focus on remaining follow-up');
   });
 
-  it('preserves a failed Netlify deploy across overflow and resumes without restarting discovery', async () => {
+  it('asks for a generic deployment-target decision after overflow, then resumes without restarting discovery', async () => {
     const assistant = fakeAssistant();
     assistant.getSdkSessionId.mockReturnValue(null);
     const log = new EventLog(process.env.CLEMENTINE_HOME);
     const append = (over: Partial<RunEvent>) => log.append({
-      runId: 'run-netlify',
+      runId: 'run-deploy',
       seq: 0,
       ts: '2026-05-13T09:13:17.741Z',
       kind: 'llm_text',
@@ -238,16 +239,16 @@ describe('gateway context overflow retry', () => {
 
     mocks.runAgent
       .mockImplementationOnce(async (_prompt: string, opts: { onRunStart?: (runId: string) => void }) => {
-        opts.onRunStart?.('run-netlify');
+        opts.onRunStart?.('run-deploy');
         append({
           seq: 0,
           kind: 'tool_call',
           toolName: 'Agent',
           toolUseId: 'agent-discovery',
           toolInput: {
-            description: 'Find team coachies project',
+            description: 'Find product site project',
             subagent_type: 'discovery',
-            prompt: 'Find a local project related to team coachies or coaches.',
+            prompt: 'Find the local product site project.',
           },
         });
         append({
@@ -259,9 +260,9 @@ describe('gateway context overflow retry', () => {
               type: 'text',
               text: [
                 'Found: 1 matching project',
-                'Path: `/Users/thompsonfamilycomputer/Desktop/Track Coaches/coach-recruiting-report.html`',
+                'Path: `/Users/example/Projects/product-site/dist/index.html`',
                 'No deploy.json found.',
-                'agentId: a36e4c46d6c496a79',
+                'agentId: agent-discovery-1',
               ].join('\n'),
             },
           ],
@@ -272,7 +273,7 @@ describe('gateway context overflow retry', () => {
           toolName: 'Read',
           toolUseId: 'read-html',
           toolInput: {
-            file_path: '/Users/thompsonfamilycomputer/Desktop/Track Coaches/coach-recruiting-report.html',
+            file_path: '/Users/example/Projects/product-site/dist/index.html',
           },
         });
         append({
@@ -285,27 +286,42 @@ describe('gateway context overflow retry', () => {
             originalBytes: 17600,
             capBytes: 3500,
             bytesShed: 14100,
-            archivePath: '/Users/thompsonfamilycomputer/.clementine/tool-archive/run-netlify/Read__read-html.json',
+            archivePath: '/Users/example/.clementine/tool-archive/run-deploy/Read__read-html.json',
           },
         });
         append({
           seq: 4,
           kind: 'tool_call',
-          toolName: 'Bash',
-          toolUseId: 'netlify-fail',
+          toolName: 'Write',
+          toolUseId: 'write-html',
           toolInput: {
-            command: 'cd "/Users/thompsonfamilycomputer/Desktop/Track Coaches" && netlify deploy --prod --dir=. --site=jacob-thompson-recruiting 2>&1 | tail -40',
+            file_path: '/Users/example/Projects/product-site/dist/index.html',
           },
         });
         append({
           seq: 5,
           kind: 'tool_result',
-          toolUseId: 'netlify-fail',
-          toolResult: ' ›   Error: Project not found. Please rerun "netlify link"\nShell cwd was reset to /Users/thompsonfamilycomputer/.clementine',
+          toolUseId: 'write-html',
+          toolResult: 'File created successfully at: /Users/example/Projects/product-site/dist/index.html',
+        });
+        append({
+          seq: 6,
+          kind: 'tool_call',
+          toolName: 'Bash',
+          toolUseId: 'deploy-fail',
+          toolInput: {
+            command: 'cd "/Users/example/Projects/product-site" && netlify deploy --prod --dir=dist 2>&1 | tail -40',
+          },
+        });
+        append({
+          seq: 7,
+          kind: 'tool_result',
+          toolUseId: 'deploy-fail',
+          toolResult: 'Error: Project not found. Please rerun "netlify link"\nShell cwd was reset to /Users/example/.clementine',
         });
         throw new Error('Autocompact is thrashing');
       })
-      .mockResolvedValueOnce(fakeRunResult('Linked the Netlify site and deployed the report.'));
+      .mockResolvedValueOnce(fakeRunResult('Linked the deployment target and deployed the site.'));
 
     const gateway = new Gateway(assistant as never) as Gateway & {
       getAgentManager: () => unknown;
@@ -316,34 +332,64 @@ describe('gateway context overflow retry', () => {
 
     const response = await gateway.handleMessage(
       'discord:user:123',
-      'can you finish redesigning the team coachies html doc and then host to netlify pease',
+      'can you finish the product landing page and deploy it please',
     );
 
-    expect(response).toContain('That run hit the context limit');
-    expect(response).toContain('Delegated work completed');
-    expect(response).toContain('Needs attention');
+    expect(response).toContain('I need one decision');
+    expect(response).toContain('Provider: Netlify');
+    expect(response).toContain('not linked to a deployment target');
     expect(response).toContain('netlify deploy --prod');
     expect(response).toContain('Project not found. Please rerun "netlify link"');
-    expect(response).toContain('Reply `continue`');
+    expect(response).toContain('create target');
+    expect(response).toContain('use existing <target-slug-or-id>');
 
-    const continued = await gateway.handleMessage('discord:user:123', 'continue');
-    expect(continued).toBe('Linked the Netlify site and deployed the report.');
+    (gateway as unknown as {
+      createBackgroundOffer: (sessionKey: string, prompt: string, recommendation: {
+        reasons: string[];
+        suggestedMaxMinutes: number;
+        plan: string[];
+        queueImmediately: true;
+      }) => unknown;
+    }).createBackgroundOffer('discord:user:123', 'stale background offer', {
+      reasons: ['test stale offer'],
+      suggestedMaxMinutes: 30,
+      plan: ['do unrelated background work'],
+      queueImmediately: true,
+    });
+
+    const ambiguousYes = await gateway.handleMessage('discord:user:123', 'yes');
+    expect(ambiguousYes).toContain('I need a specific decision');
+    expect(mocks.runAgent).toHaveBeenCalledTimes(1);
+
+    const vague = await gateway.handleMessage('discord:user:123', 'continue');
+    expect(vague).toContain('I need a specific decision');
+    expect(vague).toContain('create target');
+    expect(mocks.runAgent).toHaveBeenCalledTimes(1);
+
+    const continued = await gateway.handleMessage('discord:user:123', 'create target');
+    expect(continued).toBe('Linked the deployment target and deployed the site.');
     expect(mocks.runAgent).toHaveBeenCalledTimes(2);
     const continuationPrompt = mocks.runAgent.mock.calls[1]![0] as string;
-    expect(continuationPrompt).toContain('Failed side effects');
+    expect(continuationPrompt).toContain('needs_user_decision -> executing');
+    expect(continuationPrompt).toContain('Decision kind: blocked_external_action');
+    expect(continuationPrompt).toContain('Provider: Netlify');
+    expect(continuationPrompt).toContain('Create/link a new deployment target');
     expect(continuationPrompt).toContain('netlify deploy --prod');
     expect(continuationPrompt).toContain('Project not found. Please rerun "netlify link"');
-    expect(continuationPrompt).toContain('Do not repeat discovery/research');
-    expect(continuationPrompt).toContain('Find team coachies project');
+    expect(continuationPrompt).toContain('Completed before the block');
+    expect(continuationPrompt).toContain('dist/index.html');
+    expect(continuationPrompt).toContain('Do not restart project discovery');
+    expect(continuationPrompt).toContain('Discovery already completed');
     expect(continuationPrompt).toContain('Original owner request');
-    expect(continuationPrompt).toContain('can you finish redesigning the team coachies html doc');
+    expect(continuationPrompt).toContain('can you finish the product landing page');
   });
 
   it('retries with fresh SDK session when overflow happens on a resumed session (1.18.196)', async () => {
     // 1.18.196 — SDK session JSONLs can grow to 80+MB after months of
     // chat. Resuming one of those blows context on the first user
     // message. Smart recovery: drop the resume, retry once fresh.
-    // Zach hit this on a freshly-installed 1.18.195.
+    // A freshly-installed version still inherits old provider session
+    // files from the user's data directory.
     const assistant = fakeAssistant(); // getSdkSessionId returns 'sdk-old'
     mocks.runAgent
       .mockRejectedValueOnce(new Error('Prompt is too long'))
@@ -359,7 +405,7 @@ describe('gateway context overflow retry', () => {
     const progress = vi.fn(async () => undefined);
     const response = await gateway.handleMessage(
       'discord:user:123',
-      'Please recreate the coaches dashboard in the project and host it on Netlify.',
+      'Please rebuild the product dashboard in the project and publish it.',
       undefined,
       undefined,
       undefined,
@@ -397,7 +443,7 @@ describe('gateway context overflow retry', () => {
 
     const response = await gateway.handleMessage(
       'discord:user:123',
-      'Please recreate the coaches dashboard in the project and host it on Netlify.',
+      'Please rebuild the product dashboard in the project and publish it.',
     );
 
     expect(response).toContain('past the context limit');
@@ -421,7 +467,7 @@ describe('gateway context overflow retry', () => {
 
     const response = await gateway.handleMessage(
       'discord:user:123',
-      'Please recreate the coaches dashboard in the project and host it on Netlify.',
+      'Please rebuild the product dashboard in the project and publish it.',
     );
 
     expect(response).toContain('past the context limit');
@@ -447,7 +493,7 @@ describe('gateway context overflow retry', () => {
 
     const response = await gateway.handleMessage(
       'discord:user:123',
-      'Please recreate the coaches dashboard in the project and host it on Netlify.',
+      'Please rebuild the product dashboard in the project and publish it.',
     );
 
     expect(response).toBe('done after fresh-session retry');
@@ -470,7 +516,7 @@ describe('gateway context overflow retry', () => {
 
     const response = await gateway.handleMessage(
       'discord:user:123',
-      'Please recreate the coaches dashboard in the project and host it on Netlify.',
+      'Please rebuild the product dashboard in the project and publish it.',
     );
 
     // 1.18.194 — overflow no longer queues a planner task. SDK's own
@@ -486,8 +532,8 @@ describe('gateway context overflow retry', () => {
 
   it('queues immediately when the user explicitly asks for background work', async () => {
     const assistant = fakeAssistant();
-    // The narrow detector only returns a recommendation when EXPLICIT_BACKGROUND_RE
-    // matches. The mock simulates that branch firing — chat must not run.
+    // The detector can return recommendations for explicit background wording
+    // or inferred durable batch work. Either way, chat must not run inline.
     mocks.detectComplexTaskForBackground.mockReturnValue({
       reasons: ['explicit background/deep-work wording'],
       suggestedMaxMinutes: 90,
@@ -504,7 +550,7 @@ describe('gateway context overflow retry', () => {
 
     const response = await gateway.handleMessage(
       'discord:user:123',
-      'Run this in the background: recreate the coaches dashboard and host it on Netlify overnight.',
+      'Run this in the background: rebuild the product dashboard and publish it overnight.',
     );
 
     expect(response).toContain('Queued background task');
@@ -514,15 +560,17 @@ describe('gateway context overflow retry', () => {
     expect(id).toBeTruthy();
     const task = loadBackgroundTask(id!);
     expect(task?.prompt).toContain('Background task from chat');
-    expect(task?.prompt).toContain('recreate the coaches dashboard');
+    expect(task?.prompt).toContain('rebuild the product dashboard');
   });
 
-  it('does NOT pre-queue ordinary "build and deploy" chat — that runs in-chat now', async () => {
-    // Saturday-feel guard: chat should not silently route project-build /
-    // deploy requests to the Tasks tab. The model uses planner/researcher
-    // subagents and Bash for the work, in the live SDK loop.
+  it('queues immediately when the detector infers durable batch work', async () => {
     const assistant = fakeAssistant();
-    mocks.runAgent.mockResolvedValueOnce(fakeRunResult('deployed to Netlify'));
+    mocks.detectComplexTaskForBackground.mockReturnValue({
+      reasons: ['large batch (100 items)', '2 named systems'],
+      suggestedMaxMinutes: 90,
+      plan: ['Run discovery preflight.', 'Process records in bounded batches.'],
+      queueImmediately: true,
+    });
 
     const gateway = new Gateway(assistant as never) as Gateway & {
       getAgentManager: () => unknown;
@@ -533,10 +581,33 @@ describe('gateway context overflow retry', () => {
 
     const response = await gateway.handleMessage(
       'discord:user:123',
-      'Look at this project locally, do X, Y, and Z, spin up an HTML file, send it back, host it on Netlify.',
+      'Research 100 businesses, put the results in Google Sheets, then draft Outlook emails.',
     );
 
-    expect(response).toBe('deployed to Netlify');
+    expect(response).toContain('Queued background task');
+    expect(mocks.runAgent).not.toHaveBeenCalled();
+  });
+
+  it('does NOT pre-queue ordinary "build and deploy" chat — that runs in-chat now', async () => {
+    // Saturday-feel guard: chat should not silently route project-build /
+    // deploy requests to the Tasks tab. The model uses planner/researcher
+    // subagents and Bash for the work, in the live SDK loop.
+    const assistant = fakeAssistant();
+    mocks.runAgent.mockResolvedValueOnce(fakeRunResult('published the site'));
+
+    const gateway = new Gateway(assistant as never) as Gateway & {
+      getAgentManager: () => unknown;
+      _maybeRouteToSpecialist: () => Promise<null>;
+    };
+    gateway.getAgentManager = vi.fn(() => null);
+    gateway._maybeRouteToSpecialist = vi.fn(async () => null);
+
+    const response = await gateway.handleMessage(
+      'discord:user:123',
+      'Look at this project locally, do X, Y, and Z, spin up an HTML file, send it back, and publish it.',
+    );
+
+    expect(response).toBe('published the site');
     expect(response).not.toContain('Queued background task');
     expect(mocks.runAgent).toHaveBeenCalledTimes(1);
   });
@@ -575,6 +646,41 @@ describe('gateway context overflow retry', () => {
     expect(mocks.runAgent).toHaveBeenCalledTimes(2);
   });
 
+  it('can queue a new busy-session message instead of interrupting the active run', async () => {
+    process.env.CLEMENTINE_BUSY_INPUT_MODE = 'queue';
+    const assistant = fakeAssistant();
+    let firstRunStarted!: () => void;
+    let finishFirst!: () => void;
+    const firstRunReady = new Promise<void>((resolve) => { firstRunStarted = resolve; });
+    const finishFirstRun = new Promise<void>((resolve) => { finishFirst = resolve; });
+    mocks.runAgent
+      .mockImplementationOnce(async () => {
+        firstRunStarted();
+        await finishFirstRun;
+        return fakeRunResult('first finished');
+      })
+      .mockResolvedValueOnce(fakeRunResult('second finished'));
+
+    const gateway = new Gateway(assistant as never) as Gateway & {
+      getAgentManager: () => unknown;
+      _maybeRouteToSpecialist: () => Promise<null>;
+    };
+    gateway.getAgentManager = vi.fn(() => null);
+    gateway._maybeRouteToSpecialist = vi.fn(async () => null);
+
+    const first = gateway.handleMessage('discord:user:123', 'start a long task');
+    await firstRunReady;
+    const second = gateway.handleMessage('discord:user:123', 'add this after it finishes');
+
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(mocks.runAgent).toHaveBeenCalledTimes(1);
+
+    finishFirst();
+    await expect(first).resolves.toBe('first finished');
+    await expect(second).resolves.toBe('second finished');
+    expect(mocks.runAgent).toHaveBeenCalledTimes(2);
+  });
+
   it('surfaces clean recovery message when both attempts overflow', async () => {
     // Result-shaped overflow on a resumed session → retry fresh → retry
     // ALSO returns overflow result → surface recovery message.
@@ -592,7 +698,7 @@ describe('gateway context overflow retry', () => {
 
     const response = await gateway.handleMessage(
       'discord:user:123',
-      'Please recreate the coaches dashboard in the project and host it on Netlify.',
+      'Please rebuild the product dashboard in the project and publish it.',
     );
 
     // 1.18.194 — no more planner queue on result-shaped overflow either.
@@ -632,12 +738,12 @@ describe('gateway context overflow retry', () => {
       chatPrompt: 'Deploy the dashboard.',
       turnContextPrefix: 'x'.repeat(20_000),
       project: {
-        path: '/Users/zach/Projects/Track Coaches',
-        description: 'Track coaches dashboard',
+        path: '/Users/example/Projects/product-dashboard',
+        description: 'Product dashboard',
       },
     });
 
-    expect(prompt).toContain('/Users/zach/Projects/Track Coaches');
+    expect(prompt).toContain('/Users/example/Projects/product-dashboard');
     expect(prompt).toContain('Deploy the dashboard.');
     expect(prompt).toContain('trimmed oversized carry-over context');
     expect(prompt.length).toBeLessThan(7_000);

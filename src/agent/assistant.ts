@@ -336,6 +336,10 @@ function mcpTool(name: string): string {
   return `mcp__${TOOLS_SERVER}__${name}`;
 }
 
+function mcpServerWildcard(serverName: string): string {
+  return `mcp__${serverName}__*`;
+}
+
 const CLEMENTINE_CORE_TOOL_NAMES = [
   'working_memory',
   'user_model',
@@ -1998,6 +2002,34 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         fullSurface: false,
       };
     }
+    const profileComposioAllowList = (profile as { allowedComposioToolkits?: string[] } | null | undefined)?.allowedComposioToolkits;
+    if (!toolsDisabledForCall
+      && !isPlanStep
+      && !toolRoute.fullSurface
+      && Array.isArray(toolRoute.composioToolkits)
+      && !Array.isArray(profileComposioAllowList)) {
+      try {
+        const { listConnectedToolkits, matchConnectedToolkitsInText } =
+          await import('../integrations/composio/client.js');
+        const composioRoutingText = [
+          directScopeText,
+          allowContextToolRoute ? contextRoutingText : '',
+        ].filter(Boolean).join('\n');
+        const mentioned = matchConnectedToolkitsInText(
+          composioRoutingText,
+          await listConnectedToolkits(),
+        );
+        if (mentioned.length > 0) {
+          toolRoute = {
+            ...toolRoute,
+            composioToolkits: [...new Set([...toolRoute.composioToolkits, ...mentioned])],
+            reason: 'matched',
+          };
+        }
+      } catch (err) {
+        logger.debug({ err }, 'Connected Composio toolkit text match failed (non-fatal)');
+      }
+    }
 
     let allowedTools: string[] = [];
     const addAllowed = (...tools: string[]) => {
@@ -2192,9 +2224,8 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     if (!toolsDisabledForCall && !isPlanStep) {
       try {
         const { buildComposioMcpServers } = await import('../integrations/composio/mcp-bridge.js');
-        const profileAllowList = (profile as { allowedComposioToolkits?: string[] } | null | undefined)?.allowedComposioToolkits;
-        const allowList = Array.isArray(profileAllowList)
-          ? profileAllowList
+        const allowList = Array.isArray(profileComposioAllowList)
+          ? profileComposioAllowList
           : toolRoute.composioToolkits;
         composioMcpServers = await buildComposioMcpServers(allowList);
       } catch (err) {
@@ -2203,6 +2234,9 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       }
     }
     const composioConnectedSlugs = Object.keys(composioMcpServers);
+    if (!toolsDisabledForCall) {
+      for (const slug of composioConnectedSlugs) addAllowed(mcpServerWildcard(slug));
+    }
 
     const { stable, volatile: volatilePromptPart } = this.buildSystemPrompt({
       isHeartbeat, cronTier: isPlanStep ? null : cronTier, retrievalContext, profile, sessionKey, model: resolvedModel, verboseLevel, intentClassification,

@@ -50,47 +50,47 @@ describe('analyzeAgentDecisions', () => {
   });
 
   it('returns dormant pattern when no decisions exist', () => {
-    const r = analyzeAgentDecisions('ross-the-sdr', 7, { ledgerPath });
+    const r = analyzeAgentDecisions('sales-agent', 7, { ledgerPath });
     expect(r.totalDecisions).toBe(0);
     expect(r.patterns[0]).toMatch(/No decisions/);
     expect(r.suggestions[0]).toMatch(/dormant/i);
   });
 
   it('counts decisions only for the requested agent (filter by context.owner)', () => {
-    recordDecision(decision(), context({ owner: 'ross-the-sdr' }), { filePath: ledgerPath });
-    recordDecision(decision(), context({ owner: 'sasha-the-cmo' }), { filePath: ledgerPath });
-    recordDecision(decision(), context({ owner: 'ross-the-sdr' }), { filePath: ledgerPath });
+    recordDecision(decision(), context({ owner: 'sales-agent' }), { filePath: ledgerPath });
+    recordDecision(decision(), context({ owner: 'marketing-agent' }), { filePath: ledgerPath });
+    recordDecision(decision(), context({ owner: 'sales-agent' }), { filePath: ledgerPath });
 
-    const ross = analyzeAgentDecisions('ross-the-sdr', 7, { ledgerPath });
-    expect(ross.totalDecisions).toBe(2);
+    const alex = analyzeAgentDecisions('sales-agent', 7, { ledgerPath });
+    expect(alex.totalDecisions).toBe(2);
 
-    const sasha = analyzeAgentDecisions('sasha-the-cmo', 7, { ledgerPath });
-    expect(sasha.totalDecisions).toBe(1);
+    const morgan = analyzeAgentDecisions('marketing-agent', 7, { ledgerPath });
+    expect(morgan.totalDecisions).toBe(1);
   });
 
   it('treats unowned records as Clementine\'s decisions', () => {
     recordDecision(decision(), context({}), { filePath: ledgerPath }); // no owner
-    recordDecision(decision(), context({ owner: 'ross-the-sdr' }), { filePath: ledgerPath });
+    recordDecision(decision(), context({ owner: 'sales-agent' }), { filePath: ledgerPath });
 
     const clem = analyzeAgentDecisions('clementine', 7, { ledgerPath });
     expect(clem.totalDecisions).toBe(1);
-    const ross = analyzeAgentDecisions('ross-the-sdr', 7, { ledgerPath });
-    expect(ross.totalDecisions).toBe(1);
+    const alex = analyzeAgentDecisions('sales-agent', 7, { ledgerPath });
+    expect(alex.totalDecisions).toBe(1);
   });
 
   it('flags low success rate on act_now (< 50%)', () => {
     // 3 act_now decisions, only 1 advanced — 33% success
     for (let i = 0; i < 3; i++) {
       const dec = decision({ idempotencyKey: `k${i}` });
-      const rec = recordDecision(dec, context({ owner: 'ross-the-sdr' }), { filePath: ledgerPath });
+      const rec = recordDecision(dec, context({ owner: 'sales-agent' }), { filePath: ledgerPath });
       const status = i === 0 ? 'advanced' : 'failed';
-      recordDecisionOutcome(rec.id, dec, context({ owner: 'ross-the-sdr' }), {
+      recordDecisionOutcome(rec.id, dec, context({ owner: 'sales-agent' }), {
         status,
         summary: 'test',
       }, { filePath: ledgerPath });
     }
 
-    const r = analyzeAgentDecisions('ross-the-sdr', 7, { ledgerPath });
+    const r = analyzeAgentDecisions('sales-agent', 7, { ledgerPath });
     expect(r.byAction.act_now.decided).toBe(3);
     expect(r.byAction.act_now.withOutcomes).toBe(3);
     expect(r.byAction.act_now.advanced).toBe(1);
@@ -104,11 +104,11 @@ describe('analyzeAgentDecisions', () => {
     for (let i = 0; i < 25; i++) {
       recordDecision(
         decision({ idempotencyKey: `vol-${i}` }),
-        context({ owner: 'ross-the-sdr' }),
+        context({ owner: 'sales-agent' }),
         { filePath: ledgerPath },
       );
     }
-    const r = analyzeAgentDecisions('ross-the-sdr', 7, { ledgerPath });
+    const r = analyzeAgentDecisions('sales-agent', 7, { ledgerPath });
     expect(r.totalDecisions).toBe(25);
     expect(r.patterns.some((p) => /High decision volume/i.test(p))).toBe(true);
   });
@@ -116,13 +116,13 @@ describe('analyzeAgentDecisions', () => {
   it('flags blocked outcomes when there are several', () => {
     for (let i = 0; i < 4; i++) {
       const dec = decision({ idempotencyKey: `b${i}` });
-      const rec = recordDecision(dec, context({ owner: 'ross-the-sdr' }), { filePath: ledgerPath });
-      recordDecisionOutcome(rec.id, dec, context({ owner: 'ross-the-sdr' }), {
+      const rec = recordDecision(dec, context({ owner: 'sales-agent' }), { filePath: ledgerPath });
+      recordDecisionOutcome(rec.id, dec, context({ owner: 'sales-agent' }), {
         status: 'blocked-on-user',
         summary: 'waiting',
       }, { filePath: ledgerPath });
     }
-    const r = analyzeAgentDecisions('ross-the-sdr', 7, { ledgerPath });
+    const r = analyzeAgentDecisions('sales-agent', 7, { ledgerPath });
     expect(r.byAction.act_now.blocked).toBe(4);
     expect(r.patterns.some((p) => /ended blocked/i.test(p))).toBe(true);
   });
@@ -131,11 +131,11 @@ describe('analyzeAgentDecisions', () => {
     for (let i = 0; i < 6; i++) {
       recordDecision(
         decision({ action: 'act_now', idempotencyKey: `ak${i}` }),
-        context({ owner: 'ross-the-sdr' }),
+        context({ owner: 'sales-agent' }),
         { filePath: ledgerPath },
       );
     }
-    const r = analyzeAgentDecisions('ross-the-sdr', 7, { ledgerPath });
+    const r = analyzeAgentDecisions('sales-agent', 7, { ledgerPath });
     expect(r.byAction.ask_user.decided).toBe(0);
     expect(r.patterns.some((p) => /Zero ask_user/i.test(p))).toBe(true);
   });
@@ -144,18 +144,18 @@ describe('analyzeAgentDecisions', () => {
     for (let i = 0; i < 5; i++) {
       recordDecision(
         decision({ source: 'goal', idempotencyKey: `g${i}` }),
-        context({ owner: 'ross-the-sdr' }),
+        context({ owner: 'sales-agent' }),
         { filePath: ledgerPath },
       );
     }
     for (let i = 0; i < 2; i++) {
       recordDecision(
         decision({ source: 'inbox', idempotencyKey: `i${i}` }),
-        context({ owner: 'ross-the-sdr' }),
+        context({ owner: 'sales-agent' }),
         { filePath: ledgerPath },
       );
     }
-    const r = analyzeAgentDecisions('ross-the-sdr', 7, { ledgerPath });
+    const r = analyzeAgentDecisions('sales-agent', 7, { ledgerPath });
     expect(r.topSources[0]).toEqual({ source: 'goal', count: 5 });
     expect(r.topSources[1]).toEqual({ source: 'inbox', count: 2 });
   });
@@ -163,11 +163,11 @@ describe('analyzeAgentDecisions', () => {
 
 describe('formatReflectionReport', () => {
   it('renders empty-window case as a short note', () => {
-    const r = analyzeAgentDecisions('ross-the-sdr', 7, {
+    const r = analyzeAgentDecisions('sales-agent', 7, {
       ledgerPath: path.join(tmpdir(), 'nonexistent-' + Math.random()),
     });
     const md = formatReflectionReport(r);
-    expect(md).toMatch(/# Decision reflection — ross-the-sdr/);
+    expect(md).toMatch(/# Decision reflection — sales-agent/);
     expect(md).toMatch(/## No decisions in window/);
   });
 
@@ -176,10 +176,10 @@ describe('formatReflectionReport', () => {
     const ledgerPath = path.join(dir, 'l.jsonl');
     recordDecision(
       decision({ action: 'queue', idempotencyKey: 'q1' }),
-      context({ owner: 'ross-the-sdr' }),
+      context({ owner: 'sales-agent' }),
       { filePath: ledgerPath },
     );
-    const r = analyzeAgentDecisions('ross-the-sdr', 7, { ledgerPath });
+    const r = analyzeAgentDecisions('sales-agent', 7, { ledgerPath });
     const md = formatReflectionReport(r);
     expect(md).toMatch(/## By action/);
     expect(md).toMatch(/Queued \(queue\)/);
@@ -189,7 +189,7 @@ describe('formatReflectionReport', () => {
 
 describe('formatReflectionSummary', () => {
   it('produces a compact summary suitable for working-memory', () => {
-    const r = analyzeAgentDecisions('ross-the-sdr', 7, {
+    const r = analyzeAgentDecisions('sales-agent', 7, {
       ledgerPath: path.join(tmpdir(), 'nonexistent-' + Math.random()),
     });
     const summary = formatReflectionSummary(r);

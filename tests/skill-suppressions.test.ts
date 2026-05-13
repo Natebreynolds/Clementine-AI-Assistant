@@ -44,14 +44,14 @@ describe('getManualSuppressions', () => {
   it('merges global + per-agent suppressions when an agent slug is passed', async () => {
     writeFileSync(fileAt(), JSON.stringify({
       global: ['shared-bad'],
-      'ross-the-sdr': ['ross-only-bad'],
-      'sasha-the-cmo': ['sasha-only-bad'],
+      'sales-agent': ['alex-only-bad'],
+      'marketing-agent': ['morgan-only-bad'],
     }));
     const { getManualSuppressions } = await import('../src/agent/skill-suppressions.js');
-    const r = getManualSuppressions('ross-the-sdr');
-    expect(r).toEqual(new Set(['shared-bad', 'ross-only-bad']));
-    // sasha's per-agent list must NOT leak into ross's set
-    expect(r.has('sasha-only-bad')).toBe(false);
+    const r = getManualSuppressions('sales-agent');
+    expect(r).toEqual(new Set(['shared-bad', 'alex-only-bad']));
+    // morgan's per-agent list must NOT leak into alex's set
+    expect(r.has('morgan-only-bad')).toBe(false);
   });
 
   it('returns globals only when the per-agent key is missing', async () => {
@@ -94,8 +94,8 @@ describe('setSuppression', () => {
 
   it('writes per-agent suppressions to the named slug key', async () => {
     const { setSuppression, getManualSuppressions } = await import('../src/agent/skill-suppressions.js');
-    setSuppression('ross-only', 'ross-the-sdr', true);
-    expect(getManualSuppressions('ross-the-sdr')).toEqual(new Set(['ross-only']));
+    setSuppression('alex-only', 'sales-agent', true);
+    expect(getManualSuppressions('sales-agent')).toEqual(new Set(['alex-only']));
     expect(getManualSuppressions()).toEqual(new Set()); // global stays empty
   });
 
@@ -117,14 +117,14 @@ describe('setSuppression', () => {
   it('global toggling does not affect per-agent lists and vice versa', async () => {
     const { setSuppression, listAllSuppressions } = await import('../src/agent/skill-suppressions.js');
     setSuppression('shared-name', 'global', true);
-    setSuppression('shared-name', 'ross-the-sdr', true);
+    setSuppression('shared-name', 'sales-agent', true);
     const all = listAllSuppressions();
     expect(all.global).toEqual(['shared-name']);
-    expect(all['ross-the-sdr']).toEqual(['shared-name']);
+    expect(all['sales-agent']).toEqual(['shared-name']);
     setSuppression('shared-name', 'global', false);
     const after = listAllSuppressions();
     expect(after.global).toEqual([]);
-    expect(after['ross-the-sdr']).toEqual(['shared-name']);
+    expect(after['sales-agent']).toEqual(['shared-name']);
   });
 });
 
@@ -132,13 +132,13 @@ describe('listAllSuppressions', () => {
   it('returns the full file shape including all per-agent keys', async () => {
     writeFileSync(fileAt(), JSON.stringify({
       global: ['g1'],
-      'ross-the-sdr': ['r1', 'r2'],
-      'sasha-the-cmo': ['s1'],
+      'sales-agent': ['r1', 'r2'],
+      'marketing-agent': ['s1'],
     }));
     const { listAllSuppressions } = await import('../src/agent/skill-suppressions.js');
     const all = listAllSuppressions();
     expect(all.global).toEqual(['g1']);
-    expect(all['ross-the-sdr']).toEqual(['r1', 'r2']);
-    expect(all['sasha-the-cmo']).toEqual(['s1']);
+    expect(all['sales-agent']).toEqual(['r1', 'r2']);
+    expect(all['marketing-agent']).toEqual(['s1']);
   });
 });

@@ -80,7 +80,7 @@ export interface BuildTurnContextOptions {
    *  the identity framing block. */
   ownerName?: string | null;
   /** Active hired-agent profile if running as one. Affects the
-   *  identity framing — "you are talking to Sasha right now," not
+   *  identity framing — "you are talking to this hired agent right now," not
    *  "you are Clementine". */
   profileName?: string | null;
   /** Read-only memory store handle. When absent, retrieved-memory
@@ -425,17 +425,22 @@ function buildActiveProjectBlock(project: ProjectMeta): string {
       if (parsed && typeof parsed === 'object') {
         const kind = parsed.kind ?? 'unknown';
         const site = parsed.site ?? '?';
-        const dir = parsed.dir ?? 'output';
+        const command = typeof parsed.command === 'string' ? parsed.command.replace(/\s+/g, ' ').trim() : '';
+        const dir = parsed.dir ?? (kind === 'netlify' ? 'output' : '?');
         const verifyUrl = parsed.verifyUrl ?? '?';
         lines.push('');
-        lines.push(`**Deploy config:** ${kind} → ${site} (deploy dir: \`${dir}\`, verifies at ${verifyUrl}).`);
+        const target = command
+          ? `command \`${command.slice(0, 160)}${command.length > 160 ? '...' : ''}\``
+          : `target ${site}`;
+        lines.push(`**Deploy config:** ${kind} -> ${target} (deploy dir: \`${dir}\`, verifies at ${verifyUrl}).`);
         lines.push('Use the \`project_deploy\` tool when ready — it runs the command AND curls the URL to verify before reporting success.');
       }
     } catch { /* skip */ }
   } else {
     lines.push('');
     lines.push('**No deploy config yet.** If this project should deploy somewhere, ask the owner where and ' +
-      'write `.clementine/deploy.json` with shape: `{kind: "netlify", site: "...", dir: "output", verifyUrl: "..."}`.');
+      'write `.clementine/deploy.json` with shape like `{kind: "custom", command: "npm run deploy", verifyUrl: "https://..."}`. ' +
+      'Provider adapters can add target fields such as `site` and `dir`.');
   }
 
   return lines.join('\n');

@@ -10,7 +10,7 @@
  * only way a chat turn could "enter" a project was via Discord's
  * `!project <name>` slash command — which most owners never used.
  *
- * Result: when an owner said "the coaches project, build me an HTML
+ * Result: when an owner said "the catalog project, build me an HTML
  * report," Clementine had no anchor. She free-floated, overflowed
  * context, and (in the 2026-05-11 audit) hallucinated a deploy URL.
  *
@@ -22,7 +22,7 @@
  *     to the project root.
  *  2. **Discover** filesystem candidates when the message mentions a
  *     project name that ISN'T in the registry. Surfaces "I found
- *     /Users/.../Downloads/coaches/ — link it as a project?" so the
+ *     /Users/.../Downloads/catalog/ — link it as a project?" so the
  *     owner can register a new project without leaving chat. The chat
  *     agent then calls `project_link` to add it.
  *
@@ -118,8 +118,8 @@ export function resolveProjectFromMessage(
     // 1. Exact keyword (whole word, multi-word phrase, or quoted) — 0.95
     for (const kw of keywords) {
       if (!kw) continue;
-      // Single-word keywords: whole-word match (matches "coaches" in
-      // "the coaches project" but not "coaches" in "approaches").
+      // Single-word keywords: whole-word match (matches "catalog" in
+      // "the catalog project" but not "catalog" in "approaches").
       // Multi-word keywords (e.g., "seo audit"): word-boundary substring
       // match against the whole message (since they can't appear in
       // msgWords as a single token).
@@ -149,7 +149,7 @@ export function resolveProjectFromMessage(
     // 4. Substring (3+ chars) in basename — 0.70
     if (basename.length >= 3 && msgLower.includes(basename)) {
       // Already covered by whole-word above; this catches hyphenated
-      // names like "track-coaches" referenced as "track-coaches".
+      // names like "product-catalog" referenced as "product-catalog".
       const score = 0.70;
       if (!best || best.confidence < score) {
         best = { project, confidence: score, matchedVia: 'path-basename', matchedTerm: basename };
@@ -196,7 +196,7 @@ export interface DiscoveryCandidate {
  * 1.18.189 — search order:
  *   1. Spotlight (`mdfind`) on macOS — instant, system-indexed,
  *      finds folders ANYWHERE on disk by name. Critical when the
- *      project is at depth 2+ ("~/Documents/Work/team-coaches")
+ *      project is at depth 2+ ("~/Documents/Work/team-catalog")
  *      or the owner only knows part of the name.
  *   2. Direct walk of DEFAULT_DISCOVERY_ROOTS (depth 1) — fallback
  *      for non-macOS and edge cases where Spotlight is disabled.
@@ -312,7 +312,7 @@ function computeNameScore(basename: string, term: string): number {
   if (wbRegex.test(basename)) return 0.85;
   // Substring: 0.6
   if (basename.includes(term) || term.includes(basename)) return 0.6;
-  // Partial token overlap (hyphenated names like "track-coaches" vs "coaches")
+  // Partial token overlap (hyphenated names like "product-catalog" vs "catalog")
   const basenameTokens = new Set(basename.split(/[-_\s]+/).filter(Boolean));
   const termTokens = term.split(/[-_\s]+/).filter(Boolean);
   const matchingTokens = termTokens.filter((t) => basenameTokens.has(t));

@@ -433,7 +433,7 @@ export function detectPlanApproval(message: string): PlanApprovalSignal {
  * 1.18.193 — plan-mode opt-in detector.
  *
  * Plan-mode used to auto-trigger when `classifyMessageShape` flagged a
- * message as 'multi-step'. That was too aggressive — Nora's April 28-29
+ * message as 'multi-step'. That was too aggressive — prior long-running
  * work (38 Bash calls in one chat session) would have been routed through
  * the planner unnecessarily. Comparison vs friend's 1.18.62 install showed
  * the auto-route was the main behavior divergence.

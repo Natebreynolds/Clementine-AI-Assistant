@@ -43,11 +43,11 @@ describe('proactive decision engine', () => {
 
   it('asks the user before acting on decision-shaped priorities', () => {
     const decision = decideDailyPlanPriority({
-      priority: priority({ action: 'Ask Nathan to approve the outbound sequence', urgency: 5 }),
+      priority: priority({ action: 'Ask Owner to approve the outbound sequence', urgency: 5 }),
       date: '2026-04-24',
     });
 
-    expect(requiresHumanInput('Ask Nathan to approve the outbound sequence')).toBe(true);
+    expect(requiresHumanInput('Ask Owner to approve the outbound sequence')).toBe(true);
     expect(decision.action).toBe('ask_user');
     expect(decisionShouldCreateGoalTrigger(decision)).toBe(false);
     expect(decisionShouldQueueHeartbeatWork(decision)).toBe(false);

@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 // Hoisted handles to the SDK mocks so we can reach in and rewire them
 // per-test. The Composio singleton holds onto whatever `Composio(...)` returns
@@ -9,6 +12,7 @@ const mocks = vi.hoisted(() => ({
   connectedAccountsGet: vi.fn(),
   connectedAccountsDelete: vi.fn(),
   toolsExecute: vi.fn(),
+  composioCtor: vi.fn(),
 }));
 
 vi.mock('@composio/core', () => {
@@ -23,7 +27,8 @@ vi.mock('@composio/core', () => {
     public readonly toolkits = { authorize: vi.fn() };
     public readonly authConfigs = { list: vi.fn(() => ({ items: [] })) };
 
-    constructor(_opts: unknown) {
+    constructor(opts: unknown) {
+      mocks.composioCtor(opts);
       this.client = { connectedAccounts: { list: mocks.connectedAccountsList } };
       this.connectedAccounts = {
         list: mocks.connectedAccountsList,
@@ -41,6 +46,7 @@ vi.mock('@composio/claude-agent-sdk', () => ({
 }));
 
 const ORIGINAL_API_KEY = process.env.COMPOSIO_API_KEY;
+const ORIGINAL_HOME = process.env.CLEMENTINE_HOME;
 
 describe('Composio client connection cache', () => {
   beforeEach(async () => {
@@ -56,6 +62,50 @@ describe('Composio client connection cache', () => {
   afterEach(() => {
     if (ORIGINAL_API_KEY === undefined) delete process.env.COMPOSIO_API_KEY;
     else process.env.COMPOSIO_API_KEY = ORIGINAL_API_KEY;
+    if (ORIGINAL_HOME === undefined) delete process.env.CLEMENTINE_HOME;
+    else process.env.CLEMENTINE_HOME = ORIGINAL_HOME;
+  });
+
+  it('matches arbitrary active Composio OAuth toolkits mentioned in text', async () => {
+    const { matchConnectedToolkitsInText } = await import('../src/integrations/composio/client.js');
+
+    const matches = matchConnectedToolkitsInText('Please sync Airtable and then post the update in Slack.', [
+      { slug: 'airtable', connectionId: 'conn-air', status: 'ACTIVE' },
+      { slug: 'slack', connectionId: 'conn-slack', status: 'ACTIVE' },
+      { slug: 'stripe', connectionId: 'conn-stripe', status: 'EXPIRED' },
+    ]);
+
+    expect(matches).toEqual(['airtable', 'slack']);
+  });
+
+  it('matches connected toolkit aliases and humanized underscore slugs', async () => {
+    const { matchConnectedToolkitsInText } = await import('../src/integrations/composio/client.js');
+
+    expect(matchConnectedToolkitsInText('Check the finance workspace files in one drive', [
+      { slug: 'one_drive', connectionId: 'conn-drive', status: 'ACTIVE', alias: 'Finance Workspace' },
+    ])).toEqual(['one_drive']);
+    expect(matchConnectedToolkitsInText('Check Finance Workspace for the file', [
+      { slug: 'one_drive', connectionId: 'conn-drive', status: 'ACTIVE', alias: 'Finance Workspace' },
+    ])).toEqual(['one_drive']);
+  });
+
+  it('reloads .env-backed Composio settings when the client is reset', async () => {
+    delete process.env.COMPOSIO_API_KEY;
+    const tmpHome = path.join(os.tmpdir(), `clem-composio-env-${Date.now()}`);
+    mkdirSync(tmpHome, { recursive: true });
+    process.env.CLEMENTINE_HOME = tmpHome;
+    writeFileSync(path.join(tmpHome, '.env'), 'COMPOSIO_API_KEY=first-key\n');
+
+    const { getComposio, resetComposioClient } = await import('../src/integrations/composio/client.js');
+
+    expect(getComposio()).not.toBeNull();
+    expect(mocks.composioCtor).toHaveBeenLastCalledWith(expect.objectContaining({ apiKey: 'first-key' }));
+
+    writeFileSync(path.join(tmpHome, '.env'), 'COMPOSIO_API_KEY=second-key\n');
+    resetComposioClient();
+
+    expect(getComposio()).not.toBeNull();
+    expect(mocks.composioCtor).toHaveBeenLastCalledWith(expect.objectContaining({ apiKey: 'second-key' }));
   });
 
   it('serves repeat calls from the cache without re-hitting the API', async () => {

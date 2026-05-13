@@ -394,8 +394,8 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
   // ALL global BUDGET_*_USD are 0 ("no budget anywhere" mode), the
   // hardcoded DEFAULT_BUDGETS fallback yields. Without this, a bg task
   // spawned from chat overflow (source='cron') still hit the $1.00
-  // hardcoded cron default even with every dashboard cap set to 0 —
-  // exactly the failure Zach reported on 2026-05-12. Resolution order:
+  // hardcoded cron default even with every dashboard cap set to 0.
+  // Resolution order:
   //   1. Caller's explicit options.maxBudgetUsd wins (explicit > implicit)
   //   2. If global all-zero → undefined (no cap)
   //   3. Otherwise DEFAULT_BUDGETS[source] fires as last resort

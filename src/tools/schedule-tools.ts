@@ -35,7 +35,7 @@ export function registerScheduleTools(server: McpServer): void {
       skillName: z.string().describe('The skill slug (must already exist in the catalog — call create_skill first if needed).'),
       schedule: z.string().describe('Cron expression in the configured local timezone. Examples: "0 9 * * *" = daily 9am local, "0 9 */2 * *" = every 2 days at 9am local, "0 */4 * * *" = every 4 hours, "0 7 * * 1-5" = weekdays at 7am local.'),
       enabled: z.boolean().optional().describe('When false, schedule is saved but the runner skips it. Default: true.'),
-      agentSlug: z.string().nullable().optional().describe('Optional: run as a hired agent (e.g. "ross-the-sdr"). Default: null = Clementine.'),
+      agentSlug: z.string().nullable().optional().describe('Optional: run as a hired agent (e.g. "sales-agent"). Default: null = Clementine.'),
     },
     async ({ skillName, schedule, enabled, agentSlug }) => {
       // Validate cron expression up-front so the user gets a clear

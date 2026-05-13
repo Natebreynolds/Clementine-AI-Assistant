@@ -11,7 +11,7 @@
  * ─────────────────────
  * Until 1.18.187 the chat path had no way to start a new project. The
  * only project-linking entrypoint was a Discord slash command most
- * owners didn't know about, so when the owner said "the coaches
+ * owners didn't know about, so when the owner said "the catalog
  * project, build me an HTML report," Clementine had nothing to anchor
  * to and (as the 2026-05-11 audit found) hallucinated a deploy URL
  * from memory.
@@ -52,11 +52,13 @@ const execAsync = promisify(exec);
 // ── Deploy config types ───────────────────────────────────────────────
 
 interface DeployConfig {
-  /** Deploy backend. Only 'netlify' is supported in 1.18.187; more to come. */
-  kind: 'netlify';
-  /** Site identifier as the deploy CLI knows it (slug or numeric id). */
-  site: string;
-  /** Sub-directory of the project root to deploy. Defaults to 'output'. */
+  /** Deploy backend/adapter name, e.g. "netlify", "vercel", "custom". */
+  kind: string;
+  /** Optional provider target identifier as the deploy CLI/API knows it. */
+  site?: string;
+  /** Optional command to execute from the project root for custom providers. */
+  command?: string;
+  /** Sub-directory of the project root to verify before deploy. Netlify defaults to 'output'. */
   dir?: string;
   /** Production URL to curl after deploy. Must return 2xx for success. */
   verifyUrl: string;
@@ -68,13 +70,63 @@ function readDeployConfig(projectPath: string): DeployConfig | null {
   try {
     const parsed = JSON.parse(fs.readFileSync(deployPath, 'utf-8'));
     if (!parsed || typeof parsed !== 'object') return null;
-    if (parsed.kind !== 'netlify') return null;
-    if (typeof parsed.site !== 'string' || !parsed.site) return null;
-    if (typeof parsed.verifyUrl !== 'string' || !parsed.verifyUrl) return null;
-    return parsed as DeployConfig;
+    const raw = parsed as Record<string, unknown>;
+    if (typeof raw.kind !== 'string' || !raw.kind.trim()) return null;
+    if (typeof raw.verifyUrl !== 'string' || !raw.verifyUrl.trim()) return null;
+    const config: DeployConfig = {
+      kind: raw.kind.trim(),
+      verifyUrl: raw.verifyUrl.trim(),
+      ...(typeof raw.site === 'string' && raw.site.trim() ? { site: raw.site.trim() } : {}),
+      ...(typeof raw.command === 'string' && raw.command.trim() ? { command: raw.command.trim() } : {}),
+      ...(typeof raw.dir === 'string' && raw.dir.trim() ? { dir: raw.dir.trim() } : {}),
+    };
+    if (config.kind.toLowerCase() === 'netlify' && !config.command && !config.site) return null;
+    if (config.kind.toLowerCase() !== 'netlify' && !config.command) return null;
+    return config;
   } catch {
     return null;
   }
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function deployDirForConfig(projectPath: string, config: DeployConfig): string | undefined {
+  if (config.dir) return path.resolve(projectPath, config.dir);
+  if (config.kind.toLowerCase() === 'netlify') return path.join(projectPath, 'output');
+  return undefined;
+}
+
+function buildDeployCommand(config: DeployConfig, deployDir?: string): string | null {
+  if (config.command) return config.command;
+  if (config.kind.toLowerCase() === 'netlify' && config.site && deployDir) {
+    return `netlify deploy --prod --dir ${shellQuote(deployDir)} --site ${shellQuote(config.site)}`;
+  }
+  return null;
+}
+
+function deployConfigHelp(projectPath: string): string {
+  return [
+    `Cannot deploy: ${projectPath}/.clementine/deploy.json missing or invalid. Expected one of these shapes:`,
+    '',
+    'Generic/custom provider:',
+    '{',
+    '  "kind": "custom",',
+    '  "command": "npm run deploy",',
+    '  "verifyUrl": "https://your-live-url.example/"',
+    '}',
+    '',
+    'Built-in Netlify adapter:',
+    '{',
+    '  "kind": "netlify",',
+    '  "site": "your-site-slug",',
+    '  "dir": "output",',
+    '  "verifyUrl": "https://your-site.netlify.app/"',
+    '}',
+    '',
+    'Write this file first, then retry. If the owner has not set up a deploy target yet, ask which provider and target/command to use.',
+  ].join('\n');
 }
 
 // ── Tool registration ────────────────────────────────────────────────
@@ -92,7 +144,7 @@ export function registerProjectTools(server: McpServer): void {
       '~/Documents, ~/Projects).',
     {
       query: z.string().describe(
-        'The project name as the owner mentioned it (e.g., "coaches", "track-coaches", "audit", "marketing-intel")',
+        'The project name as the owner mentioned it (e.g., "catalog", "product-catalog", "audit", "marketing-intel")',
       ),
       max_results: z.number().int().min(1).max(20).optional().describe(
         'Maximum number of candidates to return (default 5)',
@@ -142,7 +194,7 @@ export function registerProjectTools(server: McpServer): void {
       ),
       keywords: z.array(z.string()).optional().describe(
         'Words the owner might use to reference this project. Auto-includes the folder basename. ' +
-          'Example: ["coaches", "track-coaches", "recruiting"]',
+          'Example: ["catalog", "product-catalog", "recruiting"]',
       ),
     },
     async ({ path: projectPath, name, description, keywords }) => {
@@ -202,8 +254,8 @@ export function registerProjectTools(server: McpServer): void {
   server.tool(
     'project_deploy',
     'Deploy the active project using its declared `.clementine/deploy.json` config and verify the live URL ' +
-      'returns 2xx before reporting success. Use this instead of inventing your own netlify/vercel commands — ' +
-      'it guarantees the deploy actually landed by curling the result. Only works when a project is active and ' +
+      'returns 2xx before reporting success. Supports a built-in Netlify adapter or a project-declared custom ' +
+      'deploy command, so installs can use their own provider without code changes. Only works when a project is active and ' +
       'has `.clementine/deploy.json` set up.',
     {
       project_path: z.string().describe(
@@ -220,17 +272,16 @@ export function registerProjectTools(server: McpServer): void {
       }
       const config = readDeployConfig(resolved);
       if (!config) {
-        return textResult(
-          `Cannot deploy: ${resolved}/.clementine/deploy.json missing or invalid. Expected shape:\n` +
-            `{\n  "kind": "netlify",\n  "site": "your-site-slug",\n  "dir": "output",\n  "verifyUrl": "https://your-site.netlify.app/"\n}\n` +
-            `Write this file first, then retry. If the owner hasn't set up a deploy target yet, ask them which Netlify site to use.`,
-        );
+        return textResult(deployConfigHelp(resolved));
       }
-      const deployDir = path.join(resolved, config.dir ?? 'output');
-      if (!fs.existsSync(deployDir)) {
+      const deployDir = deployDirForConfig(resolved, config);
+      if (deployDir && !fs.existsSync(deployDir)) {
         return textResult(`Cannot deploy: ${deployDir} does not exist. Build the artifact first.`);
       }
-      const cmd = `netlify deploy --prod --dir "${deployDir}" --site "${config.site}"`;
+      const cmd = buildDeployCommand(config, deployDir);
+      if (!cmd) {
+        return textResult(deployConfigHelp(resolved));
+      }
       if (dry_run) {
         return textResult(`[DRY RUN] Would execute: ${cmd}\nThen curl ${config.verifyUrl} to verify HTTP 2xx.`);
       }
@@ -260,8 +311,8 @@ export function registerProjectTools(server: McpServer): void {
       } catch (err) {
         return textResult(
           `Deploy command FAILED:\n${String(err)}\n\n` +
-            `Common causes: netlify CLI not logged in (run \`netlify login\`), site slug wrong, ` +
-            `or the deploy dir is empty/missing. Tell the owner the deploy did not succeed.`,
+            `Common causes: provider CLI/API auth is missing, the target identifier is wrong, ` +
+            `or the deploy artifact is empty/missing. Tell the owner the deploy did not succeed.`,
         );
       }
     },

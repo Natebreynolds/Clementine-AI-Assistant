@@ -197,11 +197,11 @@ describe('buildSkillContext — pinned + auto-match composition', () => {
   });
 
   it('agent-scoped skills resolve when an agentSlug is passed', async () => {
-    writeAgentSkill('ross-the-sdr', 'agent-only-skill', {
+    writeAgentSkill('sales-agent', 'agent-only-skill', {
       title: 'Agent only', description: 'lives under the agent', triggers: ['x'],
     });
     const result = await buildSkillContext(
-      'ross-the-sdr:job', 'prompt', 'ross-the-sdr',
+      'sales-agent:job', 'prompt', 'sales-agent',
       ['agent-only-skill'], null,
     );
     expect(result.applied).toHaveLength(1);

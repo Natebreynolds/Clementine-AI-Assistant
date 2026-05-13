@@ -110,13 +110,13 @@ describe('applyFix dispatch — kind: prompt-override', () => {
     const autoApply: AutoApplyPromptOverride = {
       kind: 'prompt-override',
       scope: 'agent',
-      scopeKey: 'ross-the-sdr',
-      content: 'Ross-specific rule.',
+      scopeKey: 'sales-agent',
+      content: 'Alex-specific rule.',
     };
     const result = applyFix('any-job', autoApply, { baseDir });
     expect(result.ok).toBe(true);
-    const written = path.join(baseDir, 'prompt-overrides', 'agents', 'ross-the-sdr.md');
-    expect(readFileSync(written, 'utf-8')).toBe('Ross-specific rule.');
+    const written = path.join(baseDir, 'prompt-overrides', 'agents', 'sales-agent.md');
+    expect(readFileSync(written, 'utf-8')).toBe('Alex-specific rule.');
   });
 
   it('writes a job override to jobs/<jobName>.md', () => {

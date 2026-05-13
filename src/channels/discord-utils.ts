@@ -126,6 +126,38 @@ export function chunkText(text: string, maxLen = 1900): string[] {
   return chunks;
 }
 
+function formatAttachmentBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return 'unknown size';
+  if (bytes < 1024) return `${bytes} B`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${Math.round(kb)} KB`;
+  return `${(kb / 1024).toFixed(1)} MB`;
+}
+
+function compactAttachmentField(value: string | null | undefined, fallback: string, max = 160): string {
+  const compact = (value ?? '').replace(/\s+/g, ' ').trim();
+  if (!compact) return fallback;
+  return compact.length > max ? `${compact.slice(0, max - 1)}...` : compact;
+}
+
+export function describeDiscordAttachments(message: Pick<Message, 'attachments'>): string[] {
+  const attachments = [...message.attachments.values()];
+  return attachments.map((att) => {
+    const name = compactAttachmentField(att.name, 'unnamed attachment', 120);
+    const type = compactAttachmentField(att.contentType, 'unknown type', 80);
+    const size = formatAttachmentBytes(att.size ?? 0);
+    const url = compactAttachmentField(att.url, 'no url', 300);
+    const label = att.contentType?.startsWith('image/') ? 'Image attached' : 'File attached';
+    return `[${label}: ${name}; type=${type}; size=${size}; url=${url}]`;
+  });
+}
+
+export function buildDiscordMessageText(message: Pick<Message, 'content' | 'attachments'>): string {
+  const attachmentLines = describeDiscordAttachments(message);
+  const text = message.content.trim();
+  return [...attachmentLines, text].filter(Boolean).join('\n');
+}
+
 export async function sendChunked(
   channel: Message['channel'],
   text: string,

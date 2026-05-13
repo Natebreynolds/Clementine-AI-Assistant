@@ -24,7 +24,7 @@ describe('background task MCP tools', () => {
   it('attaches the active chat session key when the agent queues background work', async () => {
     dir = mkdtempSync(path.join(tmpdir(), 'clementine-bg-tool-'));
     process.env.CLEMENTINE_HOME = dir;
-    process.env.CLEMENTINE_TEAM_AGENT = 'ross-the-sdr';
+    process.env.CLEMENTINE_TEAM_AGENT = 'sales-agent';
     process.env.CLEMENTINE_SESSION_KEY = 'discord:user:123';
     vi.resetModules();
 
@@ -46,7 +46,7 @@ describe('background task MCP tools', () => {
 
     const tasks = listBackgroundTasks();
     expect(tasks).toHaveLength(1);
-    expect(tasks[0].fromAgent).toBe('ross-the-sdr');
+    expect(tasks[0].fromAgent).toBe('sales-agent');
     expect(tasks[0].sessionKey).toBe('discord:user:123');
     expect(tasks[0].maxMinutes).toBe(20);
   });

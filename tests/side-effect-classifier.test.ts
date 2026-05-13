@@ -14,7 +14,7 @@ describe('side-effect classifier', () => {
   it('keeps unknown Bash in its own bucket', () => {
     expect(classifyToolCall('Bash', { command: 'ls -la' }).kind).toBe('read_only');
     expect(classifyToolCall('Bash', { command: 'sf data update record --sobject Contact --record-id 003x --values A=b' }).kind).toBe('side_effect');
-    expect(classifyToolCall('Bash', { command: 'netlify deploy --prod --dir=. --site=jacob-thompson-recruiting' }).kind).toBe('side_effect');
+    expect(classifyToolCall('Bash', { command: 'netlify deploy --prod --dir=. --site=example-product-site' }).kind).toBe('side_effect');
     expect(classifyToolCall('Bash', { command: 'node scripts/custom-workflow.js' }).kind).toBe('unknown');
   });
 

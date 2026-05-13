@@ -30,10 +30,10 @@ describe('Active project block (1.18.187 Part B)', () => {
     fs.mkdirSync(path.join(tmpProject, '.clementine'), { recursive: true });
     fs.writeFileSync(
       path.join(tmpProject, '.clementine', 'STATUS.md'),
-      '# Track Coaches\n\nLinked 2026-05-12. First task: HTML report.',
+      '# Product Site\n\nLinked 2026-05-12. First task: HTML report.',
     );
     fs.mkdirSync(path.join(tmpProject, 'sources'), { recursive: true });
-    fs.writeFileSync(path.join(tmpProject, 'sources', 'coaches.csv'), 'col,a\n1,2');
+    fs.writeFileSync(path.join(tmpProject, 'sources', 'products.csv'), 'col,a\n1,2');
     fs.mkdirSync(path.join(tmpProject, 'output'), { recursive: true });
 
     const result = buildClementineTurnContext({
@@ -41,8 +41,8 @@ describe('Active project block (1.18.187 Part B)', () => {
       sessionKey: 'chat',
       activeProject: {
         path: tmpProject,
-        description: 'Track Coaches migration',
-        keywords: ['coaches'],
+        description: 'Product site migration',
+        keywords: ['products'],
       },
       now: NOW,
     });
@@ -78,6 +78,27 @@ describe('Active project block (1.18.187 Part B)', () => {
     expect(result.block).toContain('project_deploy');
   });
 
+  it('renders custom deploy commands without requiring Netlify', () => {
+    fs.mkdirSync(path.join(tmpProject, '.clementine'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpProject, '.clementine', 'deploy.json'),
+      JSON.stringify({
+        kind: 'custom',
+        command: 'npm run deploy',
+        verifyUrl: 'https://example.com/',
+      }),
+    );
+    const result = buildClementineTurnContext({
+      userMessage: 'deploy',
+      sessionKey: 'chat',
+      activeProject: { path: tmpProject },
+      now: NOW,
+    });
+    expect(result.block).toContain('custom');
+    expect(result.block).toContain('npm run deploy');
+    expect(result.block).toContain('project_deploy');
+  });
+
   it('suggests creating deploy.json when missing', () => {
     const result = buildClementineTurnContext({
       userMessage: 'deploy this',
@@ -87,6 +108,7 @@ describe('Active project block (1.18.187 Part B)', () => {
     });
     expect(result.block).toContain('No deploy config');
     expect(result.block).toContain('.clementine/deploy.json');
+    expect(result.block).toContain('"custom"');
   });
 
   it('skips the block when activeProject path does not exist', () => {

@@ -1238,7 +1238,7 @@ export class HeartbeatScheduler {
       const cronCall = buildInsightCheckCronCall(prompt);
       // 1.18.132 — fix the "Prompt is too long" loop. Insight-check is
       // an internal Haiku classifier ("should we proactively message
-      // Nathan?") with a tightly-built prompt assembled by
+      // Owner?") with a tightly-built prompt assembled by
       // gatherInsightSignals + buildInsightPrompt. Without predictable
       // mode the runtime ALSO injected MEMORY.md (8k cap) + team
       // comms + delegation queue + auto-matched skills (up to 4 skill
