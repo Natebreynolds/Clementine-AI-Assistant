@@ -229,17 +229,66 @@ describe('buildGuardHooks integration', () => {
     expect(stats.inspected).toBe(0);
   });
 
-  it('returns hook entries for PostToolUse + PreCompact + PostCompact', () => {
+  it('returns hook entries for PreToolUse + PostToolUse + compact hooks', () => {
     const { hooks } = buildGuardHooks({
       runId: 'run-1',
       config: defaultGuardConfig(),
     });
     // If the guard is enabled, all three must be present.
     if (hooks.PostToolUse) {
+      expect(hooks.PreToolUse).toBeDefined();
       expect(hooks.PostToolUse).toHaveLength(1);
       expect(hooks.PreCompact).toBeDefined();
       expect(hooks.PostCompact).toBeDefined();
     }
+  });
+
+  it('writes oversized Write inputs out-of-band and denies native Write to protect context', async () => {
+    const largeWrites: Array<{ filePath: string; contentBytes: number; archivePath: string | null }> = [];
+    const target = join(archiveDir, 'report.html');
+    const content = `<!doctype html>\n${'A'.repeat(20_000)}`;
+    const { hooks, stats } = buildGuardHooks({
+      runId: 'run-large-write',
+      config: defaultGuardConfig(),
+      archiveBaseDir: archiveDir,
+      onLargeWrite: (info) => {
+        largeWrites.push({
+          filePath: info.filePath,
+          contentBytes: info.contentBytes,
+          archivePath: info.archivePath,
+        });
+      },
+    });
+    if (!hooks.PreToolUse) return;
+
+    const cb = hooks.PreToolUse[0].hooks[0];
+    const result = await cb({
+      hook_event_name: 'PreToolUse',
+      tool_name: 'Write',
+      tool_input: { file_path: target, content },
+      tool_use_id: 'tu_write_big',
+      session_id: 'sess',
+    } as unknown as Parameters<typeof cb>[0], 'tu_write_big', { signal: new AbortController().signal });
+
+    expect(readFileSync(target, 'utf8')).toBe(content);
+    expect(stats.largeWrites).toBe(1);
+    expect(largeWrites).toHaveLength(1);
+    expect(largeWrites[0].filePath).toBe(target);
+    expect(largeWrites[0].archivePath).toContain('Write__tu_write_big__input.json');
+    expect(existsSync(largeWrites[0].archivePath!)).toBe(true);
+
+    const out = result as {
+      hookSpecificOutput?: {
+        permissionDecision?: string;
+        permissionDecisionReason?: string;
+        additionalContext?: string;
+        updatedInput?: Record<string, unknown>;
+      };
+    };
+    expect(out.hookSpecificOutput?.permissionDecision).toBe('deny');
+    expect(out.hookSpecificOutput?.permissionDecisionReason).toContain('already wrote');
+    expect(out.hookSpecificOutput?.additionalContext).toContain('continue with the remaining requested steps');
+    expect(String(out.hookSpecificOutput?.updatedInput?.content ?? '')).not.toContain('A'.repeat(1000));
   });
 
   it('invokes onCompress and updates stats when the hook fires', async () => {

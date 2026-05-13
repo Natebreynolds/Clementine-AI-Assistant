@@ -58,13 +58,32 @@ describe('run summary', () => {
         runId: 'run-b',
         seq: 2,
         kind: 'tool_call',
+        toolName: 'Write',
+        toolUseId: 'write-1',
+        toolInput: { file_path: '/tmp/coach-recruiting-report.html', content: '<html></html>' },
+      }));
+      log.append(ev({
+        runId: 'run-b',
+        seq: 3,
+        kind: 'tool_result',
+        toolUseId: 'write-1',
+        toolResult: {
+          successful: true,
+          _clementine_large_write_guard: true,
+          filePath: '/tmp/coach-recruiting-report.html',
+        },
+      }));
+      log.append(ev({
+        runId: 'run-b',
+        seq: 4,
+        kind: 'tool_call',
         toolName: 'Bash',
         toolUseId: 'unknown-1',
         toolInput: { command: 'node scripts/custom-workflow.js' },
       }));
       log.append(ev({
         runId: 'run-b',
-        seq: 3,
+        seq: 5,
         kind: 'tool_call',
         toolName: 'Agent',
         toolUseId: 'agent-1',
@@ -72,7 +91,7 @@ describe('run summary', () => {
       }));
       log.append(ev({
         runId: 'run-b',
-        seq: 4,
+        seq: 6,
         kind: 'tool_result',
         toolUseId: 'agent-1',
         toolResult: [
@@ -93,7 +112,7 @@ describe('run summary', () => {
       }));
 
       const summary = summarizeRunSideEffects(['run-a', 'run-b'], log);
-      expect(summary.successfulSideEffects).toHaveLength(1);
+      expect(summary.successfulSideEffects).toHaveLength(2);
       expect(summary.successfulSideEffects[0].result?.statusCode).toBe(202);
       expect(summary.successfulDelegations).toHaveLength(1);
       expect(summary.readOnlyCount).toBe(1);
@@ -101,6 +120,7 @@ describe('run summary', () => {
 
       const message = formatOverflowRecoveryMessage(summary);
       expect(message).toContain('1 email sends completed');
+      expect(message).toContain('1 Write completed');
       expect(message).toContain('kevin@example.com');
       expect(message).toContain('Delegated work completed');
       expect(message).toContain('/tmp/full-agent-result.json');
@@ -109,6 +129,7 @@ describe('run summary', () => {
       const prompt = buildContinuationPrompt(summary, 'fire off those emails');
       expect(prompt).toContain('DO NOT re-run completed side effects');
       expect(prompt).toContain('kevin@example.com');
+      expect(prompt).toContain('/tmp/coach-recruiting-report.html');
       expect(prompt).toContain('Denver legal search');
       expect(prompt).toContain('logId log_123');
       expect(prompt).toContain('Do not repeat discovery/research');

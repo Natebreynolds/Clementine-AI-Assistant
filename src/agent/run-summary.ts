@@ -255,6 +255,17 @@ function extractSubject(input: Record<string, unknown>): string | undefined {
   return firstString(input.subject, input.title);
 }
 
+function extractFilePath(input: Record<string, unknown>, raw?: unknown): string | undefined {
+  return firstString(input.file_path, input.filePath, input.path, input.target_path, input.targetPath)
+    ?? (raw && typeof raw === 'object'
+      ? firstString(
+          (raw as Record<string, unknown>).filePath,
+          (raw as Record<string, unknown>).file_path,
+          (raw as Record<string, unknown>).path,
+        )
+      : undefined);
+}
+
 function extractProviderLogId(raw: unknown): string | undefined {
   if (!raw || typeof raw !== 'object') return undefined;
   const obj = raw as Record<string, unknown>;
@@ -359,9 +370,11 @@ export function formatOverflowRecoveryMessage(summary: RunSummary): string {
 function formatDetailedCall(call: SideEffectCall): string {
   const recipients = extractRecipients(call.input);
   const subject = extractSubject(call.input);
+  const filePath = extractFilePath(call.input, call.result?.raw);
   const logId = call.result ? extractProviderLogId(call.result.raw) : undefined;
   const parts = [
     toolKindLabel(call.toolName),
+    filePath ? `file ${filePath}` : undefined,
     recipients.length ? `to ${recipients.join(', ')}` : undefined,
     subject ? `subject "${subject}"` : undefined,
     call.result ? statusPhrase(call) : 'started, no confirmation',

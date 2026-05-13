@@ -1,6 +1,7 @@
 /**
- * tool-output-guard — PostToolUse hook that bounds per-call tool output size
- * so the SDK's auto-compactor can never thrash on a runaway MCP result.
+ * tool-output-guard — SDK hooks that bound per-call tool output size and
+ * out-of-band very large artifact writes so the SDK's auto-compactor can
+ * never thrash on runaway MCP results or generated files.
  *
  * Why this exists
  * ───────────────
@@ -20,8 +21,9 @@
  *
  * The fix is the canonical Anthropic primitive: a `PostToolUse` hook that
  * returns `hookSpecificOutput.updatedToolOutput` to replace the result
- * before it reaches the model. From sdk.d.ts:1979 — "Replaces the tool
- * output before it is sent to the model."
+ * before it reaches the model. A companion `PreToolUse` hook handles large
+ * `Write` inputs by writing the artifact to disk before the native tool can
+ * echo a giant file body into the parent conversation.
  *
  * Design properties
  * ─────────────────
@@ -46,7 +48,7 @@
  */
 
 import { mkdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 import pino from 'pino';
 
 import { BASE_DIR, TOOL_OUTPUT_GUARD } from '../config.js';
@@ -56,6 +58,7 @@ import type {
   HookEvent,
   HookJSONOutput,
   PostToolUseHookInput,
+  PreToolUseHookInput,
   PreCompactHookInput,
   PostCompactHookInput,
 } from '@anthropic-ai/claude-agent-sdk';
@@ -100,10 +103,12 @@ export interface GuardRunStats {
   bytesShed: number;
   /** Number of SDK auto-compactions observed for this run. */
   compactions: number;
+  /** Large file writes completed out-of-band before reaching the SDK context. */
+  largeWrites: number;
 }
 
 function freshStats(): GuardRunStats {
-  return { inspected: 0, compressed: 0, ceilingHits: 0, bytesShed: 0, compactions: 0 };
+  return { inspected: 0, compressed: 0, ceilingHits: 0, bytesShed: 0, compactions: 0, largeWrites: 0 };
 }
 
 // ── Size estimation ───────────────────────────────────────────────────
@@ -149,6 +154,33 @@ interface CompressionContext {
   toolInput?: unknown;
   archivePath: string | null;
   cap: number;
+}
+
+const LARGE_WRITE_INPUT_BYTES = 8_000;
+
+function writeArchiveFile(
+  baseDir: string,
+  runId: string,
+  toolUseId: string,
+  toolName: string,
+  suffix: string,
+  payload: unknown,
+): string | null {
+  try {
+    const dir = join(baseDir, 'tool-archive', runId);
+    mkdirSync(dir, { recursive: true });
+    const safeName = toolName.replace(/[^a-zA-Z0-9_-]+/g, '_').slice(0, 80);
+    const safeSuffix = suffix.replace(/[^a-zA-Z0-9_-]+/g, '_').slice(0, 30);
+    const file = join(dir, `${safeName}__${toolUseId}${safeSuffix ? `__${safeSuffix}` : ''}.json`);
+    const body = typeof payload === 'string'
+      ? payload
+      : JSON.stringify(payload, null, 2);
+    writeFileSync(file, body, 'utf8');
+    return file;
+  } catch (err) {
+    logger.debug({ err, toolName, runId }, 'tool-output-guard: archive write failed (non-fatal)');
+    return null;
+  }
 }
 
 /** First attempt: trim the list inside the response down to head + tail items. */
@@ -342,20 +374,7 @@ function archivePayload(
   toolName: string,
   payload: unknown,
 ): string | null {
-  try {
-    const dir = join(baseDir, 'tool-archive', runId);
-    mkdirSync(dir, { recursive: true });
-    const safeName = toolName.replace(/[^a-zA-Z0-9_-]+/g, '_').slice(0, 80);
-    const file = join(dir, `${safeName}__${toolUseId}.json`);
-    const body = typeof payload === 'string'
-      ? payload
-      : JSON.stringify(payload, null, 2);
-    writeFileSync(file, body, 'utf8');
-    return file;
-  } catch (err) {
-    logger.debug({ err, toolName, runId }, 'tool-output-guard: archive write failed (non-fatal)');
-    return null;
-  }
+  return writeArchiveFile(baseDir, runId, toolUseId, toolName, '', payload);
 }
 
 // ── Adaptive cap computation ──────────────────────────────────────────
@@ -487,6 +506,15 @@ export interface GuardHookOptions {
     ceilingHit: boolean;
     archivePath: string | null;
   }) => void;
+  /** Optional callback fired when a large Write input is completed
+   *  out-of-band by the guard before the native Write tool runs. */
+  onLargeWrite?: (info: {
+    toolName: string;
+    toolUseId: string;
+    filePath: string;
+    contentBytes: number;
+    archivePath: string | null;
+  }) => void;
   /** Optional source of the current cumulative context-usage ratio
    *  (cache_read + input) / window. Returns a number in [0,1]. The
    *  guard calls this once per tool result to adapt the cap. When
@@ -501,6 +529,27 @@ export interface GuardHookHandles {
   hooks: Partial<Record<HookEvent, HookCallbackMatcher[]>>;
   /** Aggregated telemetry — read after the run completes. */
   stats: GuardRunStats;
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function largeWriteInput(input: unknown): { filePath: string; content: string; contentBytes: number } | null {
+  const obj = asRecord(input);
+  const filePath = typeof obj.file_path === 'string' ? obj.file_path.trim() : '';
+  const content = typeof obj.content === 'string' ? obj.content : '';
+  if (!filePath || !content || !isAbsolute(filePath)) return null;
+  const contentBytes = estimateBytes(content);
+  if (contentBytes <= LARGE_WRITE_INPUT_BYTES) return null;
+  return { filePath, content, contentBytes };
+}
+
+function writeLargeFileOutOfBand(filePath: string, content: string): void {
+  mkdirSync(dirname(filePath), { recursive: true });
+  writeFileSync(filePath, content, 'utf8');
 }
 
 /**
@@ -521,6 +570,83 @@ export function buildGuardHooks(opts: GuardHookOptions): GuardHookHandles {
   }
 
   const config = opts.config ?? defaultGuardConfig();
+
+  const preToolUse: HookCallback = async (input, toolUseID) => {
+    if (input.hook_event_name !== 'PreToolUse') {
+      return {} as HookJSONOutput;
+    }
+    const evt = input as PreToolUseHookInput;
+    const toolName = String(evt.tool_name ?? 'unknown');
+    if (toolName !== 'Write') return {} as HookJSONOutput;
+
+    const toolUseId = String(toolUseID ?? evt.tool_use_id ?? 'unknown');
+    const large = largeWriteInput(evt.tool_input);
+    if (!large) return {} as HookJSONOutput;
+
+    const archivePath = writeArchiveFile(
+      opts.archiveBaseDir ?? BASE_DIR,
+      opts.runId,
+      toolUseId,
+      toolName,
+      'input',
+      evt.tool_input,
+    );
+
+    try {
+      writeLargeFileOutOfBand(large.filePath, large.content);
+    } catch (err) {
+      logger.warn({
+        err,
+        toolName,
+        toolUseId,
+        filePath: large.filePath,
+        contentBytes: large.contentBytes,
+      }, 'tool-output-guard: large Write out-of-band write failed; allowing native tool');
+      return {} as HookJSONOutput;
+    }
+
+    stats.largeWrites += 1;
+    stats.bytesShed += Math.max(0, large.contentBytes - 400);
+
+    logger.info({
+      toolName,
+      toolUseId,
+      filePath: large.filePath,
+      contentBytes: large.contentBytes,
+      archivePath,
+    }, 'tool-output-guard: completed large Write out-of-band');
+
+    if (opts.onLargeWrite) {
+      try {
+        opts.onLargeWrite({
+          toolName,
+          toolUseId,
+          filePath: large.filePath,
+          contentBytes: large.contentBytes,
+          archivePath,
+        });
+      } catch { /* best-effort */ }
+    }
+
+    const reason = [
+      `Clementine large-write guard already wrote ${formatBytes(large.contentBytes)} to ${large.filePath}.`,
+      archivePath ? `Full original Write input archived at ${archivePath}.` : undefined,
+      'Do not retry Write. Treat the file creation as complete and continue with the remaining requested steps, such as verification or deploy.',
+    ].filter(Boolean).join(' ');
+
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse' as const,
+        permissionDecision: 'deny' as const,
+        permissionDecisionReason: reason,
+        additionalContext: reason,
+        updatedInput: {
+          file_path: large.filePath,
+          content: `[Clementine large-write guard wrote the full ${formatBytes(large.contentBytes)} content out-of-band. ${archivePath ? `Original input: ${archivePath}` : 'Original input was not archived.'}]`,
+        },
+      },
+    } as HookJSONOutput;
+  };
 
   const postToolUse: HookCallback = async (input, toolUseID) => {
     // We only react to PostToolUse — the hook list is keyed by event,
@@ -615,6 +741,7 @@ export function buildGuardHooks(opts: GuardHookOptions): GuardHookHandles {
 
   return {
     hooks: {
+      PreToolUse: [{ hooks: [preToolUse] }],
       PostToolUse: [{ hooks: [postToolUse] }],
       PreCompact: [{ hooks: [preCompact] }],
       PostCompact: [{ hooks: [postCompact] }],

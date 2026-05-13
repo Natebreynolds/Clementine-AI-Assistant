@@ -602,8 +602,25 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
             },
           });
         },
+        onLargeWrite: (info) => {
+          writeEvent({
+            kind: 'tool_result',
+            ts: new Date().toISOString(),
+            sessionId,
+            toolUseId: info.toolUseId,
+            toolResult: {
+              successful: true,
+              _clementine_large_write_guard: true,
+              tool: info.toolName,
+              filePath: info.filePath,
+              contentBytes: info.contentBytes,
+              ...(info.archivePath ? { archivePath: info.archivePath } : {}),
+              message: 'Large Write completed out-of-band; native Write tool denied to protect parent context.',
+            },
+          });
+        },
       })
-    : { hooks: {}, stats: { inspected: 0, compressed: 0, ceilingHits: 0, bytesShed: 0, compactions: 0 } };
+    : { hooks: {}, stats: { inspected: 0, compressed: 0, ceilingHits: 0, bytesShed: 0, compactions: 0, largeWrites: 0 } };
 
   // ── Tool-call dedup hook (1.18.173) ─────────────────────────────────
   // Breaks the "re-fetch after compaction" loop that crashed the
@@ -1033,12 +1050,13 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
     finalTextChars: finalText.length,
     // 1.18.169 — tool-output guard summary, surfaced for observability.
     // Non-zero `compressed` means the guard kept the SDK from thrashing.
-    guard: guard.stats.inspected > 0 ? {
+    guard: (guard.stats.inspected > 0 || guard.stats.largeWrites > 0) ? {
       inspected: guard.stats.inspected,
       compressed: guard.stats.compressed,
       bytesShed: guard.stats.bytesShed,
       compactions: guard.stats.compactions,
       ceilingHits: guard.stats.ceilingHits,
+      largeWrites: guard.stats.largeWrites,
     } : undefined,
     // 1.18.173 — tool-call dedup summary. Non-zero warned/blocked means
     // the model tried to re-fetch identical data (typically a
