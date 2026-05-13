@@ -41,6 +41,9 @@ export interface RunSummary {
   failedSideEffects: SideEffectCall[];
   pendingSideEffects: SideEffectCall[];
   unknownEffectCalls: SideEffectCall[];
+  successfulDelegations: SideEffectCall[];
+  failedDelegations: SideEffectCall[];
+  pendingDelegations: SideEffectCall[];
   readOnlyCount: number;
   errors: Array<{ runId: string; ts: string; message: string }>;
   lastAssistantText?: string;
@@ -118,12 +121,21 @@ export function summarizeRunSideEffects(
   const failedSideEffects: SideEffectCall[] = [];
   const pendingSideEffects: SideEffectCall[] = [];
   const unknownEffectCalls: SideEffectCall[] = [];
+  const successfulDelegations: SideEffectCall[] = [];
+  const failedDelegations: SideEffectCall[] = [];
+  const pendingDelegations: SideEffectCall[] = [];
   let readOnlyCount = 0;
 
   for (const call of events.filter(isToolCall)) {
     const verdict = classifyToolCall(call.toolName, asInput(call.toolInput));
     const result = resultForToolUse(events, call.toolUseId);
     const item = makeCall(call, result, verdict);
+    if (call.toolName === 'Agent') {
+      if (!result) pendingDelegations.push(item);
+      else if (item.result?.successful) successfulDelegations.push(item);
+      else failedDelegations.push(item);
+      continue;
+    }
     if (verdict.kind === 'read_only') {
       readOnlyCount += 1;
       continue;
@@ -163,6 +175,9 @@ export function summarizeRunSideEffects(
     failedSideEffects,
     pendingSideEffects,
     unknownEffectCalls,
+    successfulDelegations,
+    failedDelegations,
+    pendingDelegations,
     readOnlyCount,
     errors,
     ...(lastAssistantText ? { lastAssistantText } : {}),
@@ -174,7 +189,10 @@ export function hasOperationalActivity(summary: RunSummary): boolean {
   return summary.successfulSideEffects.length > 0
     || summary.failedSideEffects.length > 0
     || summary.pendingSideEffects.length > 0
-    || summary.unknownEffectCalls.length > 0;
+    || summary.unknownEffectCalls.length > 0
+    || summary.successfulDelegations.length > 0
+    || summary.failedDelegations.length > 0
+    || summary.pendingDelegations.length > 0;
 }
 
 function toolKindLabel(toolName: string): string {
@@ -263,6 +281,42 @@ function formatGroupedLines(prefix: string, calls: SideEffectCall[]): string[] {
   return groupCounts(calls).map((group) => `- ${group.count} ${group.label} ${prefix}${recipientPreview(group.calls)}`);
 }
 
+function collectResultText(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) return value.map(collectResultText).filter(Boolean).join('\n');
+  if (!value || typeof value !== 'object') return '';
+  const obj = value as Record<string, unknown>;
+  return ['text', 'content', 'result', 'message']
+    .map((key) => collectResultText(obj[key]))
+    .filter(Boolean)
+    .join('\n');
+}
+
+function extractAgentArchivePath(text: string): string | undefined {
+  return text.match(/Full payload archived at `([^`]+)`/)?.[1]
+    ?? text.match(/Full output:\s*([^\n]+)/)?.[1]?.trim();
+}
+
+function extractAgentId(text: string): string | undefined {
+  return text.match(/\bagentId:\s*([a-zA-Z0-9_-]+)/)?.[1];
+}
+
+function formatDelegationCall(call: SideEffectCall, status: string): string {
+  const description = firstString(call.input.description, call.input.task, call.input.prompt)?.slice(0, 120);
+  const subagentType = firstString(call.input.subagent_type, call.input.subagentType);
+  const resultText = call.result ? collectResultText(call.result.raw) : '';
+  const agentId = extractAgentId(resultText);
+  const archivePath = extractAgentArchivePath(resultText);
+  const pieces = [
+    subagentType ? `${subagentType} subagent` : 'subagent',
+    status,
+    description ? `for "${description}"` : undefined,
+    agentId ? `agentId ${agentId}` : undefined,
+    archivePath ? `archive ${archivePath}` : undefined,
+  ].filter(Boolean);
+  return `- ${pieces.join(' · ')}`;
+}
+
 export function formatOverflowRecoveryMessage(summary: RunSummary): string {
   const lines: string[] = [
     'That run hit the context limit after some work had already happened.',
@@ -273,10 +327,24 @@ export function formatOverflowRecoveryMessage(summary: RunSummary): string {
     lines.push(...formatGroupedLines('completed', summary.successfulSideEffects));
     lines.push('');
   }
-  if (summary.failedSideEffects.length > 0 || summary.pendingSideEffects.length > 0 || summary.unknownEffectCalls.length > 0) {
+  if (summary.successfulDelegations.length > 0) {
+    lines.push('Delegated work completed before overflow:');
+    for (const call of summary.successfulDelegations.slice(0, 5)) lines.push(formatDelegationCall(call, 'completed'));
+    if (summary.successfulDelegations.length > 5) lines.push(`- ...and ${summary.successfulDelegations.length - 5} more completed subagent calls`);
+    lines.push('');
+  }
+  if (
+    summary.failedSideEffects.length > 0
+    || summary.pendingSideEffects.length > 0
+    || summary.unknownEffectCalls.length > 0
+    || summary.failedDelegations.length > 0
+    || summary.pendingDelegations.length > 0
+  ) {
     lines.push('Needs attention:');
     if (summary.failedSideEffects.length > 0) lines.push(...formatGroupedLines('failed', summary.failedSideEffects));
     if (summary.pendingSideEffects.length > 0) lines.push(...formatGroupedLines('started, no confirmation', summary.pendingSideEffects));
+    for (const call of summary.failedDelegations.slice(0, 5)) lines.push(formatDelegationCall(call, 'failed'));
+    for (const call of summary.pendingDelegations.slice(0, 5)) lines.push(formatDelegationCall(call, 'started, no confirmation'));
     if (summary.unknownEffectCalls.length > 0) lines.push(`- ${summary.unknownEffectCalls.length} tool call(s) had unknown external effect`);
     lines.push('');
   }
@@ -313,6 +381,11 @@ export function buildContinuationPrompt(summary: RunSummary, originalRequest: st
     lines.push('Completed side effects:');
     for (const call of summary.successfulSideEffects.slice(0, 80)) lines.push(formatDetailedCall(call));
     if (summary.successfulSideEffects.length > 80) lines.push(`- ...and ${summary.successfulSideEffects.length - 80} more completed side effects in the event log.`);
+    lines.push('');
+  }
+  if (summary.successfulDelegations.length > 0) {
+    lines.push('Completed delegated work. Do not repeat discovery/research already done unless the archive is insufficient:');
+    for (const call of summary.successfulDelegations.slice(0, 20)) lines.push(formatDelegationCall(call, 'completed'));
     lines.push('');
   }
   if (summary.failedSideEffects.length > 0) {

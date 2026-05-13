@@ -62,16 +62,48 @@ describe('run summary', () => {
         toolUseId: 'unknown-1',
         toolInput: { command: 'node scripts/custom-workflow.js' },
       }));
+      log.append(ev({
+        runId: 'run-b',
+        seq: 3,
+        kind: 'tool_call',
+        toolName: 'Agent',
+        toolUseId: 'agent-1',
+        toolInput: { subagent_type: 'discovery', description: 'Map Track Coaches project' },
+      }));
+      log.append(ev({
+        runId: 'run-b',
+        seq: 4,
+        kind: 'tool_result',
+        toolUseId: 'agent-1',
+        toolResult: [
+          {
+            type: 'text',
+            text: [
+              '[Clementine compacted this Agent result to protect the parent chat context.]',
+              'Subagent: discovery',
+              'Task: Map Track Coaches project',
+              'agentId: abc123',
+              'Full payload archived at `/tmp/full-agent-result.json` — call `Read` on that path for the full Agent result.',
+              '',
+              'Decision-grade handoff:',
+              'Found: 1 matching project',
+            ].join('\n'),
+          },
+        ],
+      }));
 
       const summary = summarizeRunSideEffects(['run-a', 'run-b'], log);
       expect(summary.successfulSideEffects).toHaveLength(1);
       expect(summary.successfulSideEffects[0].result?.statusCode).toBe(202);
+      expect(summary.successfulDelegations).toHaveLength(1);
       expect(summary.readOnlyCount).toBe(1);
       expect(summary.unknownEffectCalls).toHaveLength(1);
 
       const message = formatOverflowRecoveryMessage(summary);
       expect(message).toContain('1 email sends completed');
       expect(message).toContain('kevin@example.com');
+      expect(message).toContain('Delegated work completed');
+      expect(message).toContain('/tmp/full-agent-result.json');
       expect(message).toContain('unknown external effect');
 
       const prompt = buildContinuationPrompt(summary, 'fire off those emails');
@@ -79,6 +111,8 @@ describe('run summary', () => {
       expect(prompt).toContain('kevin@example.com');
       expect(prompt).toContain('Denver legal search');
       expect(prompt).toContain('logId log_123');
+      expect(prompt).toContain('Do not repeat discovery/research');
+      expect(prompt).toContain('Map Track Coaches project');
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

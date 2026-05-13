@@ -145,6 +145,8 @@ const VERBOSE_FIELDS = [
 
 interface CompressionContext {
   toolName: string;
+  toolUseId?: string;
+  toolInput?: unknown;
   archivePath: string | null;
   cap: number;
 }
@@ -167,6 +169,103 @@ function tryListShrink(value: unknown, ctx: CompressionContext): unknown | null 
     }
   }
   return null;
+}
+
+function collectTextFragments(value: unknown): string[] {
+  if (typeof value === 'string') return [value];
+  if (Array.isArray(value)) return value.flatMap((item) => collectTextFragments(item));
+  if (!value || typeof value !== 'object') return [];
+  const obj = value as Record<string, unknown>;
+  const out: string[] = [];
+  for (const key of ['text', 'content', 'result', 'message']) {
+    const v = obj[key];
+    if (typeof v === 'string') out.push(v);
+    else if (Array.isArray(v) || (v && typeof v === 'object')) out.push(...collectTextFragments(v));
+  }
+  return out;
+}
+
+function objectField(value: unknown, key: string): string | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? typeof (value as Record<string, unknown>)[key] === 'string'
+      ? String((value as Record<string, unknown>)[key]).trim()
+      : undefined
+    : undefined;
+}
+
+function extractAgentId(text: string): string | undefined {
+  return text.match(/\bagentId:\s*([a-zA-Z0-9_-]+)/)?.[1];
+}
+
+function extractUsageLine(text: string): string | undefined {
+  const match = text.match(/<usage>[\s\S]*?(?:<\/usage>|$)/);
+  return match?.[0]?.replace(/\s+/g, ' ').trim().slice(0, 220);
+}
+
+function stripAgentBoilerplate(text: string): string {
+  return text
+    .replace(/agentId:\s*[a-zA-Z0-9_-]+[\s\S]*$/i, '')
+    .replace(/<usage>[\s\S]*$/i, '')
+    .replace(/^\s*(perfect|great|okay|ok)[.!]?\s+now\s+i\s+have[^\n]*\n+/i, '')
+    .trim();
+}
+
+function compactMarkdownLines(text: string): string {
+  const lines = stripAgentBoilerplate(text)
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && line !== '---' && line !== '```');
+
+  const keep: string[] = [];
+  for (const line of lines) {
+    if (keep.length >= 26) break;
+    if (/^#{1,4}\s/.test(line) || /^[-*]\s/.test(line) || /^\d+\.\s/.test(line) || /^[A-Z][^:]{2,60}:/.test(line)) {
+      keep.push(line);
+      continue;
+    }
+    if (keep.length < 8 && line.length <= 220) keep.push(line);
+  }
+  return keep.join('\n');
+}
+
+function fitUnderBytes(text: string, maxBytes: number): string {
+  if (estimateBytes(text) <= maxBytes) return text;
+  const marker = '\n\n[...compact handoff truncated; read the archived Agent result for full detail.]';
+  let head = text.slice(0, Math.max(200, maxBytes - estimateBytes(marker) - 200));
+  while (head.length > 200 && estimateBytes(head + marker) > maxBytes) {
+    head = head.slice(0, Math.floor(head.length * 0.9));
+  }
+  return `${head.trimEnd()}${marker}`;
+}
+
+function tryAgentShrink(value: unknown, ctx: CompressionContext): unknown | null {
+  if (ctx.toolName !== 'Agent') return null;
+  const fragments = collectTextFragments(value);
+  const text = fragments.join('\n\n').trim();
+  if (!text) return null;
+
+  const subagentType = objectField(ctx.toolInput, 'subagent_type');
+  const description = objectField(ctx.toolInput, 'description');
+  const agentId = extractAgentId(text);
+  const usage = extractUsageLine(text);
+  const summary = compactMarkdownLines(text);
+  const archive = archiveHint(ctx, 'full Agent result');
+
+  const lines = [
+    '[Clementine compacted this Agent result to protect the parent chat context.]',
+    subagentType ? `Subagent: ${subagentType}` : undefined,
+    description ? `Task: ${description}` : undefined,
+    agentId ? `agentId: ${agentId}` : undefined,
+    usage,
+    archive,
+    '',
+    'Decision-grade handoff:',
+    summary || fitUnderBytes(stripAgentBoilerplate(text), Math.max(1_000, Math.floor(ctx.cap * 0.6))),
+    '',
+    'Use this handoff to continue. Read the archived result only if the missing detail is necessary.',
+  ].filter((line): line is string => typeof line === 'string' && line.length > 0);
+
+  return fitUnderBytes(lines.join('\n'), ctx.cap);
 }
 
 function shrinkArray(arr: unknown[], ctx: CompressionContext): unknown {
@@ -331,6 +430,20 @@ export function compressToolOutput(
     return { output: rawOutput, bytesShed: 0, ceilingHit: false, passthrough: true };
   }
 
+  // Agent tool results are subagent handoffs to the parent orchestrator.
+  // Preserve the decision-grade summary and archive the full result instead
+  // of letting a verbose report refill the parent context after compaction.
+  const agentShrunk = tryAgentShrink(rawOutput, ctx);
+  if (agentShrunk !== null) {
+    const bytes = estimateBytes(agentShrunk);
+    return {
+      output: agentShrunk,
+      bytesShed: Math.max(0, originalBytes - bytes),
+      ceilingHit: originalBytes > ctx.cap * 2,
+      passthrough: false,
+    };
+  }
+
   // Pass 1: list-shape shrink (preserves structure).
   const shrunk1 = tryListShrink(rawOutput, ctx);
   if (shrunk1 !== null) {
@@ -421,7 +534,10 @@ export function buildGuardHooks(opts: GuardHookOptions): GuardHookHandles {
     const rawOutput = evt.tool_response;
     stats.inspected += 1;
 
-    const usageRatio = opts.usageRatio ? safeRatio(opts.usageRatio) : 0;
+    const usageRatio = Math.max(
+      opts.usageRatio ? safeRatio(opts.usageRatio) : 0,
+      stats.compactions > 0 ? 0.75 : 0,
+    );
     const { softCap } = resolveCap(toolName, config, usageRatio);
 
     const originalBytes = estimateBytes(rawOutput);
@@ -437,10 +553,11 @@ export function buildGuardHooks(opts: GuardHookOptions): GuardHookHandles {
 
     const outcome = compressToolOutput(toolName, rawOutput, {
       toolName,
+      toolInput: evt.tool_input,
       toolUseId,
       archivePath,
       cap: softCap,
-    } as unknown as CompressionContext);
+    });
 
     stats.compressed += 1;
     stats.bytesShed += outcome.bytesShed;

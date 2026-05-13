@@ -71,6 +71,11 @@ describe('resolveCap', () => {
     expect(r.softCap).toBe(10_000);
   });
 
+  it('uses a tight default cap for Agent results', () => {
+    const r = resolveCap('Agent', defaultGuardConfig(), 0);
+    expect(r.softCap).toBeLessThanOrEqual(6_000);
+  });
+
   it('never returns a soft cap above the hard ceiling', () => {
     const cfg = { ...defaultGuardConfig(), softLimitBytes: 500_000, hardLimitBytes: 200_000 };
     const r = resolveCap('Read', cfg, 0);
@@ -127,6 +132,49 @@ describe('compressToolOutput', () => {
     expect((out.output as string).length).toBeLessThanOrEqual(6_000); // cap + marker
     expect((out.output as string)).toContain('truncated');
     expect((out.output as string)).toContain('archive.json');
+  });
+
+  it('builds compact Agent handoffs instead of returning full subagent reports', () => {
+    const report = [
+      'Perfect. Now I have all the information needed. Let me compile the structured report:',
+      '',
+      '## Track Coaches Project — Structural Map',
+      '',
+      '**Total files:** 21',
+      '',
+      '### Top-Level Files',
+      '- Coach_Data_From_Runcruit.tsv (101 rows) — Runcruit export',
+      '- College_Track_Coaches_Top100_with_Contacts.csv (101 rows) — expanded contacts',
+      '- Jacob_Thompson_Recruiting_Tracker.xlsx (557K) — primary workbook',
+      '',
+      '## Project Summary',
+      'This is a track recruiting project centered on Jacob Thompson.',
+      '',
+      '## Long tail detail',
+      'x'.repeat(12_000),
+      '',
+      'agentId: abc5c2649a209c3bc',
+      '<usage>total_tokens: 16390 tool_uses: 13 duration_ms: 31886</usage>',
+    ].join('\n');
+    const payload = [{ type: 'text', text: report }];
+
+    const out = compressToolOutput('Agent', payload, {
+      toolName: 'Agent',
+      toolUseId: 'tu_agent',
+      toolInput: { subagent_type: 'discovery', description: 'Map Track Coaches project' },
+      archivePath: '/tmp/full-agent-result.json',
+      cap: 2_500,
+    });
+
+    expect(out.passthrough).toBe(false);
+    expect(typeof out.output).toBe('string');
+    const text = out.output as string;
+    expect(estimateBytes(text)).toBeLessThanOrEqual(2_500);
+    expect(text).toContain('Subagent: discovery');
+    expect(text).toContain('Task: Map Track Coaches project');
+    expect(text).toContain('agentId: abc5c2649a209c3bc');
+    expect(text).toContain('/tmp/full-agent-result.json');
+    expect(text).not.toContain('x'.repeat(500));
   });
 
   it('flags ceilingHit when input is more than 2× the cap', () => {
@@ -249,6 +297,54 @@ describe('buildGuardHooks integration', () => {
     expect(archived.items).toHaveLength(100);
     // cleanup
     rmSync(expectedArchive, { recursive: true, force: true });
+  });
+
+  it('archives and replaces oversized Agent hook results', async () => {
+    const { hooks, stats } = buildGuardHooks({
+      runId: 'run-agent-archive',
+      config: {
+        ...defaultGuardConfig(),
+        softLimitBytes: 30_000,
+        hardLimitBytes: 200_000,
+        perTool: { Agent: 2_000 },
+      },
+      archiveBaseDir: archiveDir,
+    });
+    if (!hooks.PostToolUse) return;
+
+    const cb = hooks.PostToolUse[0].hooks[0];
+    const payload = [{
+      type: 'text',
+      text: [
+        '## Discovery Report',
+        '- /Users/example/project (12 files) — target project',
+        'Detailed section:',
+        'A'.repeat(8_000),
+        'agentId: agent-test-123',
+        '<usage>total_tokens: 9999</usage>',
+      ].join('\n'),
+    }];
+
+    const result = await cb({
+      hook_event_name: 'PostToolUse',
+      tool_name: 'Agent',
+      tool_input: { subagent_type: 'discovery', description: 'Find project' },
+      tool_response: payload,
+      tool_use_id: 'tu_agent_arc',
+      session_id: 'sess',
+    } as unknown as Parameters<typeof cb>[0], 'tu_agent_arc', { signal: new AbortController().signal });
+
+    expect(stats.compressed).toBe(1);
+    const output = (result as { hookSpecificOutput?: { updatedToolOutput?: unknown } }).hookSpecificOutput?.updatedToolOutput;
+    expect(typeof output).toBe('string');
+    expect(String(output)).toContain('Subagent: discovery');
+    expect(String(output)).toContain('agent-test-123');
+    expect(String(output)).toContain('Full payload archived at');
+
+    const file = join(archiveDir, 'tool-archive', 'run-agent-archive', 'Agent__tu_agent_arc.json');
+    expect(existsSync(file)).toBe(true);
+    const archived = JSON.parse(readFileSync(file, 'utf8'));
+    expect(archived[0].text).toContain('A'.repeat(1000));
   });
 
   it('does not call onCompress for outputs under the cap', async () => {

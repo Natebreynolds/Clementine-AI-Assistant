@@ -47,6 +47,9 @@ describe('buildAgentMap — system subagents', () => {
     // to it instead of the parent running recursive Glob/Read inline.
     const desc = discovery.description ?? '';
     expect(desc).toMatch(/file-system|find|locate|discover/i);
+    const prompt = discovery.prompt ?? '';
+    expect(prompt).toContain('Hard output limit: 250 words');
+    expect(prompt).toMatch(/Do NOT return a full project report/i);
   });
 
   it('planner uses opus and has no tools', () => {
@@ -83,6 +86,8 @@ describe('buildAgentMap — system subagents', () => {
     expect(prompt).toMatch(/send_|create_|update_|delete_/);
     // Must tell researcher it inherits from parent.
     expect(prompt.toLowerCase()).toMatch(/inherit|every tool the parent/);
+    // 1.18.206 — subagents must hand compact summaries back to Opus.
+    expect(prompt).toContain('Hard limit: 250 words');
   });
 
   it('cron-fixer has the canonical broken-job tools, not a generic surface', () => {

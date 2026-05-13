@@ -77,7 +77,7 @@ const RESEARCHER_PROMPT = [
   '',
   '## Output discipline',
   '',
-  'Return a ONE-PARAGRAPH summary in the format the parent specified. Never raw tool output, never full lists, never unbounded data dumps. If a tool returns 50KB of JSON, extract only the requested fields and discard the rest — your job is to compress.',
+  'Return a ONE-PARAGRAPH summary in the format the parent specified. Hard limit: 250 words unless the parent explicitly asks for a longer artifact. Never raw tool output, never full lists, never unbounded data dumps. If a tool returns 50KB of JSON, extract only the requested fields and discard the rest — your job is to compress.',
   '',
   'If you cannot find the requested data, say so in one line. Do not speculate.',
 ].join('\n');
@@ -122,6 +122,8 @@ const DISCOVERY_PROMPT = [
   '',
   'Recommendation: <which path the orchestrator should fetch next, if any>',
   '```',
+  '',
+  'Hard output limit: 250 words. Return decision-grade handoff only: paths, counts, sizes, and the next file/action the orchestrator should inspect. Do NOT return a full project report, long markdown excerpts, repeated file inventories, or narrative analysis. If the parent needs detail, point it at the exact file path to read next.',
   '',
   'If nothing matches, say so in one line.',
   '',
