@@ -22,8 +22,9 @@
  * The fix is the canonical Anthropic primitive: a `PostToolUse` hook that
  * returns `hookSpecificOutput.updatedToolOutput` to replace the result
  * before it reaches the model. A companion `PreToolUse` hook handles large
- * `Write` inputs by writing the artifact to disk before the native tool can
- * echo a giant file body into the parent conversation.
+ * `Write` inputs by swapping the native call to a small placeholder; the
+ * `PostToolUse` hook then restores the real artifact on disk after the
+ * placeholder write succeeds.
  *
  * Design properties
  * ─────────────────
@@ -157,6 +158,14 @@ interface CompressionContext {
 }
 
 const LARGE_WRITE_INPUT_BYTES = 8_000;
+const LARGE_WRITE_PLACEHOLDER = '[Clementine large-write guard placeholder: full content is restored after native Write succeeds.]';
+
+interface PendingLargeWrite {
+  filePath: string;
+  content: string;
+  contentBytes: number;
+  archivePath: string | null;
+}
 
 function writeArchiveFile(
   baseDir: string,
@@ -570,6 +579,7 @@ export function buildGuardHooks(opts: GuardHookOptions): GuardHookHandles {
   }
 
   const config = opts.config ?? defaultGuardConfig();
+  const pendingLargeWrites = new Map<string, PendingLargeWrite>();
 
   const preToolUse: HookCallback = async (input, toolUseID) => {
     if (input.hook_event_name !== 'PreToolUse') {
@@ -592,20 +602,12 @@ export function buildGuardHooks(opts: GuardHookOptions): GuardHookHandles {
       evt.tool_input,
     );
 
-    try {
-      writeLargeFileOutOfBand(large.filePath, large.content);
-    } catch (err) {
-      logger.warn({
-        err,
-        toolName,
-        toolUseId,
-        filePath: large.filePath,
-        contentBytes: large.contentBytes,
-      }, 'tool-output-guard: large Write out-of-band write failed; allowing native tool');
-      return {} as HookJSONOutput;
-    }
-
-    stats.largeWrites += 1;
+    pendingLargeWrites.set(toolUseId, {
+      filePath: large.filePath,
+      content: large.content,
+      contentBytes: large.contentBytes,
+      archivePath,
+    });
     stats.bytesShed += Math.max(0, large.contentBytes - 400);
 
     logger.info({
@@ -614,35 +616,23 @@ export function buildGuardHooks(opts: GuardHookOptions): GuardHookHandles {
       filePath: large.filePath,
       contentBytes: large.contentBytes,
       archivePath,
-    }, 'tool-output-guard: completed large Write out-of-band');
-
-    if (opts.onLargeWrite) {
-      try {
-        opts.onLargeWrite({
-          toolName,
-          toolUseId,
-          filePath: large.filePath,
-          contentBytes: large.contentBytes,
-          archivePath,
-        });
-      } catch { /* best-effort */ }
-    }
+    }, 'tool-output-guard: staged large Write with placeholder input');
 
     const reason = [
-      `Clementine large-write guard already wrote ${formatBytes(large.contentBytes)} to ${large.filePath}.`,
+      `Clementine large-write guard staged ${formatBytes(large.contentBytes)} for ${large.filePath}.`,
       archivePath ? `Full original Write input archived at ${archivePath}.` : undefined,
-      'Do not retry Write. Treat the file creation as complete and continue with the remaining requested steps, such as verification or deploy.',
+      'The native Write will use a small placeholder, then Clementine will restore the full content after the write succeeds. Continue with the remaining requested steps after this tool result.',
     ].filter(Boolean).join(' ');
 
     return {
       hookSpecificOutput: {
         hookEventName: 'PreToolUse' as const,
-        permissionDecision: 'deny' as const,
+        permissionDecision: 'allow' as const,
         permissionDecisionReason: reason,
         additionalContext: reason,
         updatedInput: {
           file_path: large.filePath,
-          content: `[Clementine large-write guard wrote the full ${formatBytes(large.contentBytes)} content out-of-band. ${archivePath ? `Original input: ${archivePath}` : 'Original input was not archived.'}]`,
+          content: LARGE_WRITE_PLACEHOLDER,
         },
       },
     } as HookJSONOutput;
@@ -659,6 +649,69 @@ export function buildGuardHooks(opts: GuardHookOptions): GuardHookHandles {
     const toolUseId = String(toolUseID ?? evt.tool_use_id ?? 'unknown');
     const rawOutput = evt.tool_response;
     stats.inspected += 1;
+
+    const pendingLargeWrite = toolName === 'Write' ? pendingLargeWrites.get(toolUseId) : undefined;
+    if (pendingLargeWrite) {
+      pendingLargeWrites.delete(toolUseId);
+      try {
+        writeLargeFileOutOfBand(pendingLargeWrite.filePath, pendingLargeWrite.content);
+      } catch (err) {
+        logger.warn({
+          err,
+          toolName,
+          toolUseId,
+          filePath: pendingLargeWrite.filePath,
+          contentBytes: pendingLargeWrite.contentBytes,
+          archivePath: pendingLargeWrite.archivePath,
+        }, 'tool-output-guard: failed to restore large Write content after placeholder write');
+        return {
+          hookSpecificOutput: {
+            hookEventName: 'PostToolUse' as const,
+            additionalContext: [
+              `Clementine could not restore the staged ${formatBytes(pendingLargeWrite.contentBytes)} Write content to ${pendingLargeWrite.filePath}.`,
+              pendingLargeWrite.archivePath ? `The original input is archived at ${pendingLargeWrite.archivePath}.` : undefined,
+              'Retry by writing the file in a smaller way or ask the owner for the archive path.',
+            ].filter(Boolean).join(' '),
+          },
+        } as HookJSONOutput;
+      }
+
+      stats.largeWrites += 1;
+
+      logger.info({
+        toolName,
+        toolUseId,
+        filePath: pendingLargeWrite.filePath,
+        contentBytes: pendingLargeWrite.contentBytes,
+        archivePath: pendingLargeWrite.archivePath,
+      }, 'tool-output-guard: restored large Write content after placeholder write');
+
+      if (opts.onLargeWrite) {
+        try {
+          opts.onLargeWrite({
+            toolName,
+            toolUseId,
+            filePath: pendingLargeWrite.filePath,
+            contentBytes: pendingLargeWrite.contentBytes,
+            archivePath: pendingLargeWrite.archivePath,
+          });
+        } catch { /* best-effort */ }
+      }
+
+      const restoredMessage = [
+        `File created successfully at: ${pendingLargeWrite.filePath}`,
+        `(Clementine restored ${formatBytes(pendingLargeWrite.contentBytes)} of large generated content after native Write used a placeholder to protect context.)`,
+        pendingLargeWrite.archivePath ? `Original Write input archived at: ${pendingLargeWrite.archivePath}` : undefined,
+      ].filter(Boolean).join(' ');
+
+      return {
+        hookSpecificOutput: {
+          hookEventName: 'PostToolUse' as const,
+          additionalContext: `The full file content is present at ${pendingLargeWrite.filePath}. Do not rewrite it; continue with verification, deployment, or the next requested step.`,
+          updatedToolOutput: restoredMessage,
+        },
+      } as HookJSONOutput;
+    }
 
     const usageRatio = Math.max(
       opts.usageRatio ? safeRatio(opts.usageRatio) : 0,

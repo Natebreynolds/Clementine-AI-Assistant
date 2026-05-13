@@ -4,7 +4,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { existsSync, readFileSync, rmSync, mkdtempSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -243,7 +243,7 @@ describe('buildGuardHooks integration', () => {
     }
   });
 
-  it('writes oversized Write inputs out-of-band and denies native Write to protect context', async () => {
+  it('stages oversized Write inputs with a placeholder and restores content after native Write', async () => {
     const largeWrites: Array<{ filePath: string; contentBytes: number; archivePath: string | null }> = [];
     const target = join(archiveDir, 'report.html');
     const content = `<!doctype html>\n${'A'.repeat(20_000)}`;
@@ -259,16 +259,45 @@ describe('buildGuardHooks integration', () => {
         });
       },
     });
-    if (!hooks.PreToolUse) return;
+    if (!hooks.PreToolUse || !hooks.PostToolUse) return;
 
-    const cb = hooks.PreToolUse[0].hooks[0];
-    const result = await cb({
+    const preCb = hooks.PreToolUse[0].hooks[0];
+    const preResult = await preCb({
       hook_event_name: 'PreToolUse',
       tool_name: 'Write',
       tool_input: { file_path: target, content },
       tool_use_id: 'tu_write_big',
       session_id: 'sess',
-    } as unknown as Parameters<typeof cb>[0], 'tu_write_big', { signal: new AbortController().signal });
+    } as unknown as Parameters<typeof preCb>[0], 'tu_write_big', { signal: new AbortController().signal });
+
+    const preOut = preResult as {
+      hookSpecificOutput?: {
+        permissionDecision?: string;
+        permissionDecisionReason?: string;
+        additionalContext?: string;
+        updatedInput?: Record<string, unknown>;
+      };
+    };
+    expect(preOut.hookSpecificOutput?.permissionDecision).toBe('allow');
+    expect(preOut.hookSpecificOutput?.permissionDecisionReason).toContain('staged');
+    expect(preOut.hookSpecificOutput?.additionalContext).toContain('restore the full content');
+    const placeholder = String(preOut.hookSpecificOutput?.updatedInput?.content ?? '');
+    expect(placeholder).toContain('large-write guard placeholder');
+    expect(placeholder).not.toContain('A'.repeat(1000));
+    expect(stats.largeWrites).toBe(0);
+    expect(largeWrites).toHaveLength(0);
+
+    writeFileSync(target, placeholder, 'utf8');
+
+    const postCb = hooks.PostToolUse[0].hooks[0];
+    const postResult = await postCb({
+      hook_event_name: 'PostToolUse',
+      tool_name: 'Write',
+      tool_input: { file_path: target, content: placeholder },
+      tool_response: `File created successfully at: ${target}`,
+      tool_use_id: 'tu_write_big',
+      session_id: 'sess',
+    } as unknown as Parameters<typeof postCb>[0], 'tu_write_big', { signal: new AbortController().signal });
 
     expect(readFileSync(target, 'utf8')).toBe(content);
     expect(stats.largeWrites).toBe(1);
@@ -277,18 +306,15 @@ describe('buildGuardHooks integration', () => {
     expect(largeWrites[0].archivePath).toContain('Write__tu_write_big__input.json');
     expect(existsSync(largeWrites[0].archivePath!)).toBe(true);
 
-    const out = result as {
+    const postOut = postResult as {
       hookSpecificOutput?: {
-        permissionDecision?: string;
-        permissionDecisionReason?: string;
         additionalContext?: string;
-        updatedInput?: Record<string, unknown>;
+        updatedToolOutput?: unknown;
       };
     };
-    expect(out.hookSpecificOutput?.permissionDecision).toBe('deny');
-    expect(out.hookSpecificOutput?.permissionDecisionReason).toContain('already wrote');
-    expect(out.hookSpecificOutput?.additionalContext).toContain('continue with the remaining requested steps');
-    expect(String(out.hookSpecificOutput?.updatedInput?.content ?? '')).not.toContain('A'.repeat(1000));
+    expect(String(postOut.hookSpecificOutput?.updatedToolOutput ?? '')).toContain('File created successfully');
+    expect(String(postOut.hookSpecificOutput?.updatedToolOutput ?? '')).toContain('restored');
+    expect(postOut.hookSpecificOutput?.additionalContext).toContain('continue with verification');
   });
 
   it('invokes onCompress and updates stats when the hook fires', async () => {

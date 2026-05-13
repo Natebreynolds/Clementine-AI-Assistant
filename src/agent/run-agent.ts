@@ -615,7 +615,7 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
               filePath: info.filePath,
               contentBytes: info.contentBytes,
               ...(info.archivePath ? { archivePath: info.archivePath } : {}),
-              message: 'Large Write completed out-of-band; native Write tool denied to protect parent context.',
+              message: 'Large Write content restored after placeholder Write to protect parent context.',
             },
           });
         },
