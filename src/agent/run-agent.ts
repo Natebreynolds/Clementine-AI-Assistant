@@ -108,6 +108,8 @@ import { buildDedupHook } from './tool-call-dedup.js';
 import { buildSideEffectIdempotencyHook } from './side-effect-idempotency.js';
 import { buildChatStopHook } from './chat-stop-hook.js';
 import { buildRunStateHooks } from './run-state.js';
+import { buildPreconditionGuardHooks } from './precondition-guard.js';
+import type { PendingAgentDecision } from './clarification-gate.js';
 import type { AgentProfile } from '../types.js';
 import type { AgentManager } from './agent-manager.js';
 import type { MemoryStore } from '../memory/store.js';
@@ -325,6 +327,14 @@ export interface RunAgentResult {
   allowedToolsApplied?: string[];
   builtinToolsApplied?: string[];
   mcpServersApplied?: string[];
+
+  /** A precondition classifier fired during this run, blocking a tool
+   *  call before it executed. The router surfaces this to the owner via
+   *  the pendingAgentDecision flow (clarification-gate.ts). Distinct
+   *  from the post-hoc path that runs on RunSummary.failedSideEffects —
+   *  this path means the tool NEVER ran, no partial state was left
+   *  behind. */
+  pendingAgentDecision?: PendingAgentDecision;
 }
 
 // Last-resort fallbacks for callers that pass NO maxBudgetUsd. The
@@ -699,9 +709,35 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
       })
     : null;
 
+  // ── Pre-emptive blocked-action gate (Commit 3 / 1.18.211) ──────────
+  // Evaluates registered precondition classifiers before each tool call
+  // via a PreToolUse hook. When a classifier matches (e.g. `netlify
+  // deploy` with no `.netlify/state.json` and no `.clementine/deploy.json`),
+  // the tool is denied with the decision question as the reason and the
+  // PendingAgentDecision is captured for surfacing via RunAgentResult.
+  // The router stashes it on the session and asks the owner instead of
+  // letting the tool fire and leave partial state behind. The existing
+  // post-hoc BlockedActionClassifier path (clarification-gate.ts) is
+  // unchanged and remains as the safety net for failures the pre-call
+  // rule didn't anticipate.
+  const preconditionGuard = buildPreconditionGuardHooks({
+    runId,
+    cwd: opts.cwd ?? BASE_DIR,
+    // The chat path already wires `activeProject?.path` into opts.cwd
+    // (router.ts), so cwd doubles as the active-project hint for the
+    // classifier. Falling back inside the classifier keeps the public
+    // RunAgentOptions surface unchanged.
+    activeProjectPath: opts.cwd ?? BASE_DIR,
+    originalRequest: prompt,
+  });
+
   // Merge hook maps from the modules. SDK accepts arrays of
   // HookCallbackMatcher per event; we concatenate.
   const mergedHooks: typeof guard.hooks = { ...guard.hooks };
+  for (const [evt, matchers] of Object.entries(preconditionGuard.hooks) as Array<[keyof typeof preconditionGuard.hooks, NonNullable<typeof preconditionGuard.hooks[keyof typeof preconditionGuard.hooks]>]>) {
+    const existing = mergedHooks[evt] ?? [];
+    mergedHooks[evt] = [...existing, ...matchers];
+  }
   for (const [evt, matchers] of Object.entries(idempotency.hooks) as Array<[keyof typeof idempotency.hooks, NonNullable<typeof idempotency.hooks[keyof typeof idempotency.hooks]>]>) {
     const existing = mergedHooks[evt] ?? [];
     mergedHooks[evt] = [...existing, ...matchers];
@@ -1109,6 +1145,7 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
     logger.debug({ err }, 'runAgent: subagent backfill failed (non-fatal)');
   }
 
+  const pendingAgentDecision = preconditionGuard.getCapturedDecision();
   return {
     text: finalText,
     totalCostUsd,
@@ -1122,5 +1159,6 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
     allowedToolsApplied: sdkAllowedTools,
     builtinToolsApplied: toolPolicy.builtinTools,
     mcpServersApplied: Object.keys(mcpServers),
+    ...(pendingAgentDecision ? { pendingAgentDecision } : {}),
   };
 }

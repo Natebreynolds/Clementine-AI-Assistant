@@ -3253,6 +3253,35 @@ export class Gateway {
           clearTimeout(chatTimer);
           clearTimeout(hardWallTimer);
 
+          // ── Pre-emptive blocked-action decision (Commit 3 / 1.18.211) ──
+          // The precondition guard inside runAgent denied a tool call
+          // before it fired (e.g. `netlify deploy` without a linked site).
+          // Stash the decision on the session so the next owner message
+          // is parsed as a decision reply, mirror the question into the
+          // transcript, and respond with the question text. No partial
+          // state was left behind because the tool never ran.
+          const preCallDecision = runAgentResult.pendingAgentDecision;
+          if (preCallDecision && !isBuilderSession) {
+            const state = this.getSession(sessionKey);
+            state.pendingAgentDecision = preCallDecision;
+            const decisionResponse = preCallDecision.question;
+            try {
+              this.assistant.injectContext(effectiveSessionKey, originalText, decisionResponse, {
+                pending: false,
+                model: 'chat',
+                countExchange: true,
+              });
+            } catch (err) {
+              logger.debug({ err }, 'chat: pre-call decision transcript mirror failed (non-fatal)');
+            }
+            logger.info({
+              sessionKey: effectiveSessionKey,
+              classifierId: preCallDecision.context.classifierId,
+              provider: preCallDecision.context.provider,
+            }, 'chat: precondition-guard fired pre-call; routed to PendingAgentDecision');
+            return decisionResponse;
+          }
+
           // Mirror transcript so memory + recall continue working — but
           // skip for builder sessions since their turns are spec-drafting,
           // not real conversation worth recalling later.

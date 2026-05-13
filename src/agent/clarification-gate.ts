@@ -64,6 +64,69 @@ export function registerBlockedActionClassifier(classifier: BlockedActionClassif
   };
 }
 
+// ─── Pre-call (canUseTool) classifiers ─────────────────────────────────
+// The post-hoc BlockedActionClassifier above runs AFTER a tool call has
+// already failed (the deploy fired, left state behind, returned an error
+// we then parsed). The orchestrator-first north star prefers pre-emptive
+// gates: intercept the tool call BEFORE it fires when preconditions are
+// missing. The SDK exposes `canUseTool` for exactly this purpose.
+//
+// A PreconditionClassifier inspects (toolName, input, env) and either
+// passes (returns null, tool proceeds) or matches (returns a
+// PreconditionMatch that the gate converts to a PendingAgentDecision
+// and asks the owner). Post-hoc and pre-call classifiers coexist —
+// pre-call narrows the failure surface, post-hoc remains as the safety
+// net for cases the pre-call rule didn't anticipate.
+
+export interface PreconditionEnv {
+  /** Working directory the agent will use for this tool call. */
+  cwd: string;
+  /** Active project path if the router resolved one. */
+  activeProjectPath?: string;
+  /** filesystem.existsSync injection point for testability. */
+  existsSync?: (path: string) => boolean;
+}
+
+export interface PreconditionMatch {
+  /** The command or tool action that would have run (for owner display). */
+  attemptedCommand: string;
+  /** The reason the precondition failed (for owner display). */
+  reason: string;
+  /** Optional project path inferred from the input (e.g. `cd /path && netlify deploy`). */
+  projectPath?: string;
+}
+
+export interface PreconditionClassifier {
+  id: string;
+  category: BlockedActionCategory;
+  provider: string;
+  providerLabel: string;
+  targetNoun: string;
+  targetPlaceholder: string;
+  blockerSummary: string;
+  /** Tool names this classifier inspects. e.g. ['Bash'] or
+   *  ['mcp__clementine-tools__project_deploy']. Wildcard `'*'` not supported —
+   *  classifiers should be narrow on purpose. */
+  toolNames: readonly string[];
+  /** Returns a PreconditionMatch when the call should be blocked, or null
+   *  to let it proceed. Errors thrown here are caught and treated as a pass
+   *  (fail-open) — the post-hoc classifier still catches the failure. */
+  matchesPreconditions(input: Record<string, unknown>, env: PreconditionEnv): PreconditionMatch | null;
+  createInstructions: string[];
+  existingInstructions: string[];
+}
+
+const customPreconditionClassifiers: PreconditionClassifier[] = [];
+
+/** Extension point for pre-call classifiers. Mirrors registerBlockedActionClassifier. */
+export function registerPreconditionClassifier(classifier: PreconditionClassifier): () => void {
+  customPreconditionClassifiers.unshift(classifier);
+  return () => {
+    const index = customPreconditionClassifiers.indexOf(classifier);
+    if (index >= 0) customPreconditionClassifiers.splice(index, 1);
+  };
+}
+
 function firstString(...values: unknown[]): string | undefined {
   for (const value of values) {
     if (typeof value === 'string' && value.trim()) return value.trim();
@@ -370,3 +433,133 @@ export function buildAgentDecisionContinuationPrompt(
 // Backward-compatible alias for the router/tests while callers migrate to the
 // provider-neutral name.
 export const buildRepairDecisionFromRunSummary = buildBlockedActionDecisionFromRunSummary;
+
+// ─── Pre-call decision construction ────────────────────────────────────
+
+function preconditionClassifiers(): PreconditionClassifier[] {
+  return [...customPreconditionClassifiers, ...BUILTIN_PRECONDITION_CLASSIFIERS];
+}
+
+/**
+ * Run all registered precondition classifiers against an attempted tool
+ * call. Returns the first PendingAgentDecision that matches, or null if
+ * the call should proceed. Errors inside individual classifiers are
+ * swallowed (fail-open) — the post-hoc classifier remains as the safety
+ * net for any case the pre-call rule mishandles.
+ */
+export function evaluatePreconditionsForToolCall(
+  toolName: string,
+  input: Record<string, unknown>,
+  env: PreconditionEnv,
+  opts: { originalRequest?: string; runId?: string; nowMs?: number } = {},
+): PendingAgentDecision | null {
+  const nowMs = opts.nowMs ?? Date.now();
+  for (const classifier of preconditionClassifiers()) {
+    if (!classifier.toolNames.includes(toolName)) continue;
+    let match: PreconditionMatch | null = null;
+    try {
+      match = classifier.matchesPreconditions(input, env);
+    } catch {
+      // Fail-open — the post-hoc classifier will catch a failure.
+      continue;
+    }
+    if (!match) continue;
+
+    const decision: PendingAgentDecision = {
+      id: makeDecisionId('blocked_external_action'),
+      kind: 'blocked_external_action',
+      createdAt: nowMs,
+      expiresAt: nowMs + 30 * 60_000,
+      runIds: opts.runId ? [opts.runId] : [],
+      originalRequest: opts.originalRequest ?? '',
+      question: '',
+      context: {
+        category: classifier.category,
+        classifierId: classifier.id,
+        provider: classifier.provider,
+        providerLabel: classifier.providerLabel,
+        blockerSummary: classifier.blockerSummary,
+        failedCommand: compactCommand(match.attemptedCommand),
+        error: compactValue(match.reason, 500),
+        targetNoun: classifier.targetNoun,
+        targetPlaceholder: classifier.targetPlaceholder,
+        createInstructions: classifier.createInstructions,
+        existingInstructions: classifier.existingInstructions,
+        ...(match.projectPath ? { projectPath: match.projectPath } : {}),
+      },
+    };
+    decision.question = formatDecisionPrompt(decision);
+    return decision;
+  }
+  return null;
+}
+
+// ─── Built-in precondition classifiers ─────────────────────────────────
+
+import { existsSync as nodeExistsSync } from 'node:fs';
+import { join as pathJoin } from 'node:path';
+
+/**
+ * Netlify deploy precondition: deny `netlify deploy` (or our project_deploy
+ * tool when its provider is netlify) when the project has no record of a
+ * linked site. Mirrors the post-hoc netlify_missing_deployment_target
+ * classifier but fires BEFORE the tool runs.
+ *
+ * Detection signals (any one is sufficient to allow):
+ *   - `.netlify/state.json` exists in the project dir (netlify CLI's own
+ *     link record)
+ *   - `.clementine/deploy.json` exists in the project dir (Clementine's
+ *     deploy config)
+ *
+ * If neither exists AND the project dir is identifiable, we deny pre-call
+ * and ask the owner. If the project dir is not identifiable (e.g. the
+ * agent invoked `netlify deploy` without a `cd` prefix), we fail-open
+ * and let the post-hoc classifier handle it.
+ */
+const netlifyMissingLinkPrecondition: PreconditionClassifier = {
+  id: 'netlify_missing_deployment_target',
+  category: 'deployment_target_missing',
+  provider: 'netlify',
+  providerLabel: 'Netlify',
+  targetNoun: 'deployment target',
+  targetPlaceholder: 'target-slug-or-id',
+  blockerSummary: 'This project does not have a Netlify deployment target linked yet. Deploying will fail until one is configured.',
+  toolNames: ['Bash'],
+  matchesPreconditions(input, env) {
+    const command = firstString(input.command);
+    if (!command) return null;
+    if (!/\bnetlify\s+deploy\b/i.test(command)) return null;
+
+    const projectPath = extractProjectPathFromCommand(command) ?? env.activeProjectPath;
+    if (!projectPath) return null; // can't check — fail open
+
+    const exists = env.existsSync ?? nodeExistsSync;
+    const netlifyLinked = exists(pathJoin(projectPath, '.netlify', 'state.json'));
+    const clementineDeployConfig = exists(pathJoin(projectPath, '.clementine', 'deploy.json'));
+    if (netlifyLinked || clementineDeployConfig) return null;
+
+    return {
+      attemptedCommand: compactCommand(command),
+      reason: 'No `.netlify/state.json` or `.clementine/deploy.json` found in the project. Netlify CLI will fail with "Project not found. Please rerun \'netlify link\'".',
+      projectPath,
+    };
+  },
+  createInstructions: [
+    'Create or link a new Netlify deployment target for this project, then deploy and verify the live URL.',
+    'Do not restart project discovery or reread full generated artifacts unless a small targeted read is necessary.',
+    'If provider auth, browser login, or an interactive naming choice is required and cannot be completed safely, stop and ask one concrete question.',
+    'If a Clementine deploy config is appropriate, write `.clementine/deploy.json` with the provider kind, target identifier, deploy directory, and verify URL.',
+    'Prefer `project_deploy` once deploy config exists; otherwise run the equivalent provider deploy command and verify the live URL before claiming success.',
+  ],
+  existingInstructions: [
+    'Use or link the existing Netlify target: {target}',
+    'Do not restart project discovery or reread full generated artifacts unless a small targeted read is necessary.',
+    'Write or update `.clementine/deploy.json` for the existing target before deploying when that config is supported.',
+    'Prefer `project_deploy` once deploy config exists; otherwise run the equivalent provider deploy command and verify the live URL before claiming success.',
+    'If the provider rejects the target or auth is missing, stop and ask one concrete question with the exact CLI/API error.',
+  ],
+};
+
+const BUILTIN_PRECONDITION_CLASSIFIERS: PreconditionClassifier[] = [
+  netlifyMissingLinkPrecondition,
+];
