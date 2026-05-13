@@ -2524,9 +2524,10 @@ export class Gateway {
           }
         }
 
-        // Use per-message override, then session default, then global default
+        // Use per-message override, then session default, then Opus as the
+        // chat-orchestrator default. Builder sessions still force Haiku below.
         const sess = this.sessions.get(sessionKey);
-        const effectiveModel = model ?? sess?.model;
+        const effectiveModel = model ?? sess?.model ?? MODELS.opus;
         const pendingOverflow = sess?.pendingOverflowResume;
         if (pendingOverflow) {
           const ageMs = Date.now() - pendingOverflow.summarizedAt;
@@ -3809,9 +3810,8 @@ export class Gateway {
     memoryCount: number;
   } {
     const sess = this.sessions.get(sessionKey);
-    const modelName = sess?.model
-      ? Object.entries(MODELS).find(([, v]) => v === sess.model)?.[0] ?? 'sonnet'
-      : 'sonnet';
+    const modelId = sess?.model ?? MODELS.opus;
+    const modelName = Object.entries(MODELS).find(([, v]) => v === modelId)?.[0] ?? modelId;
     const project = sess?.project;
     return {
       model: modelName.charAt(0).toUpperCase() + modelName.slice(1),

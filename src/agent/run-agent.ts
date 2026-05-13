@@ -759,6 +759,7 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
     source,
     profile: opts.profile?.slug,
     forceSubagent: opts.forceSubagent,
+    model: sdkOptions.model,
     effort,
     maxBudgetUsd: maxBudgetUsd ?? 'uncapped',
     agentCount: Object.keys(agents).length,

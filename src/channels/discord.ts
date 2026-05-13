@@ -32,7 +32,6 @@ import path from 'node:path';
 import {
   chunkText,
   DiscordStreamingMessage,
-  friendlyToolName,
   formatCronEmbed,
   rehydrateStatusEmbed,
   setSavedStatusEmbed,
@@ -1366,8 +1365,8 @@ export async function startDiscord(
         (t) => streamer.update(t),
         oneOffModel,
         oneOffMaxTurns,
-        (toolName, toolInput) => { streamer.setToolStatus(friendlyToolName(toolName, toolInput)); return Promise.resolve(); },
-        (status) => { streamer.setToolStatus(status); return Promise.resolve(); },
+        (toolName, toolInput) => { streamer.recordToolActivity(toolName, toolInput); return Promise.resolve(); },
+        (status) => { streamer.setProgressStatus(status); return Promise.resolve(); },
       );
       if (isSilentGatewayResponse(response)) {
         await streamer.discard();

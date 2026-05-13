@@ -194,11 +194,88 @@ export function friendlyToolName(name: string, input?: Record<string, unknown>):
   return `\ud83d\udd27 ${short.replace(/_/g, ' ')}`;
 }
 
+export type DiscordWorkActivityKind = 'read' | 'write' | 'command' | 'delegate' | 'external' | 'memory' | 'other';
+
+export interface DiscordWorkCardState {
+  startedAt: number;
+  status: string;
+  toolCallCount: number;
+  counts: Record<DiscordWorkActivityKind, number>;
+  recentActivities: string[];
+}
+
+function emptyWorkCounts(): Record<DiscordWorkActivityKind, number> {
+  return {
+    read: 0,
+    write: 0,
+    command: 0,
+    delegate: 0,
+    external: 0,
+    memory: 0,
+    other: 0,
+  };
+}
+
+function formatElapsed(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  return rem > 0 ? `${m}m ${rem}s` : `${m}m`;
+}
+
+function cleanCardText(value: string): string {
+  return sanitizeResponse(value.replace(/\s+/g, ' ').trim()).slice(0, 120);
+}
+
+export function classifyDiscordWorkActivity(toolName: string): DiscordWorkActivityKind {
+  const name = toolName.toLowerCase();
+  if (name === 'agent' || name.includes('agent') || name.includes('researcher') || name.includes('discovery')) return 'delegate';
+  if (name === 'bash') return 'command';
+  if (name === 'write' || name === 'edit' || name === 'notebookedit') return 'write';
+  if (name.includes('memory_') || name.includes('transcript_') || name.includes('note_')) return 'memory';
+  if (name === 'read' || name === 'glob' || name === 'grep' || name.includes('search') || name.includes('fetch') || name.includes('list') || name.includes('get_') || name.includes('read_')) return 'read';
+  if (/(^|[_\W])(send|create|update|delete|post|apply|move|rename|archive|remove|enable|disable|assign|cancel|approve|reply|forward|publish|push|insert|upsert|set)($|[_\W])/i.test(toolName)) return 'external';
+  return 'other';
+}
+
+function describeCounts(counts: Record<DiscordWorkActivityKind, number>): string {
+  const parts = [
+    ['reads', counts.read],
+    ['writes', counts.write],
+    ['commands', counts.command],
+    ['delegations', counts.delegate],
+    ['external', counts.external],
+    ['memory', counts.memory],
+  ]
+    .filter(([, count]) => Number(count) > 0)
+    .map(([label, count]) => `${label}: ${count}`);
+  return parts.length > 0 ? parts.join(' | ') : 'no tools yet';
+}
+
+export function buildDiscordWorkCard(state: DiscordWorkCardState, now = Date.now()): string {
+  const status = cleanCardText(state.status || 'thinking...');
+  const lines = [
+    '**Working**',
+    '',
+    `Status: ${status}`,
+    `Elapsed: ${formatElapsed(now - state.startedAt)} | Steps: ${state.toolCallCount}`,
+    `Tools: ${describeCounts(state.counts)}`,
+  ];
+  const recent = state.recentActivities.map(cleanCardText).filter(Boolean).slice(-5);
+  if (recent.length > 0) {
+    lines.push('', 'Recent activity:');
+    for (const item of recent) lines.push(`- ${item}`);
+  }
+  return lines.join('\n').slice(0, 1900);
+}
+
 export class DiscordStreamingMessage {
   private message: Message | null = null;
   private lastEdit = 0;
   private pendingText = '';
   private lastFlushedText = '';
+  private lastFlushedDisplay = '';
   private isFinal = false;
   private channel: Message['channel'];
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -207,6 +284,13 @@ export class DiscordStreamingMessage {
   private startTime = Date.now();
   private toolCallCount = 0;
   private lastTextTime = 0;
+  private workCard: DiscordWorkCardState = {
+    startedAt: this.startTime,
+    status: 'thinking...',
+    toolCallCount: 0,
+    counts: emptyWorkCounts(),
+    recentActivities: [],
+  };
 
   /** The message ID of the final bot response (available after finalize). */
   messageId: string | null = null;
@@ -217,20 +301,47 @@ export class DiscordStreamingMessage {
 
   async start(): Promise<void> {
     if (!('send' in this.channel)) return;
-    this.message = await this.channel.send(THINKING_INDICATOR);
+    this.message = await this.channel.send(buildDiscordWorkCard(this.workCard));
     this.lastEdit = Date.now();
     // Periodic refresh keeps elapsed time display current during long silent stretches
     this.progressTimer = setInterval(() => {
-      if (!this.isFinal && this.toolCallCount > 3) this.flush().catch(() => {});
+      if (!this.isFinal) this.flush().catch(() => {});
     }, 30_000);
   }
 
   /** Update the tool activity status line shown during streaming. */
   setToolStatus(status: string): void {
-    this.toolStatus = status;
-    this.toolCallCount++;
-    // Trigger a flush so the status is actually displayed during long tool chains
-    // where no text tokens are being emitted
+    this.recordWorkActivity(cleanCardText(status), 'other', true);
+  }
+
+  /** Update non-tool progress, such as queueing/routing/session-reset stages. */
+  setProgressStatus(status: string): void {
+    this.toolStatus = cleanCardText(status);
+    this.workCard.status = this.toolStatus;
+    this.requestFlush();
+  }
+
+  /** Record a concrete tool start so the live work card shows real activity. */
+  recordToolActivity(toolName: string, input?: Record<string, unknown>): void {
+    const label = friendlyToolName(toolName, input);
+    this.recordWorkActivity(label, classifyDiscordWorkActivity(toolName), true);
+  }
+
+  private recordWorkActivity(label: string, kind: DiscordWorkActivityKind, countStep: boolean): void {
+    const cleaned = cleanCardText(label);
+    this.toolStatus = cleaned;
+    this.workCard.status = cleaned;
+    if (countStep) {
+      this.toolCallCount++;
+      this.workCard.toolCallCount = this.toolCallCount;
+      this.workCard.counts[kind] = (this.workCard.counts[kind] ?? 0) + 1;
+      this.workCard.recentActivities.push(cleaned);
+      this.workCard.recentActivities = this.workCard.recentActivities.slice(-5);
+    }
+    this.requestFlush();
+  }
+
+  private requestFlush(): void {
     const elapsed = Date.now() - this.lastEdit;
     if (elapsed >= STREAM_EDIT_INTERVAL) {
       this.flush().catch(() => {});
@@ -315,15 +426,6 @@ export class DiscordStreamingMessage {
     }
   }
 
-  /** Format elapsed milliseconds as human-readable duration. */
-  private formatElapsed(ms: number): string {
-    const s = Math.floor(ms / 1000);
-    if (s < 60) return `${s}s`;
-    const m = Math.floor(s / 60);
-    const rem = s % 60;
-    return rem > 0 ? `${m}m ${rem}s` : `${m}m`;
-  }
-
   private async flush(): Promise<void> {
     if (!this.message || this.isFinal) return;
 
@@ -339,7 +441,7 @@ export class DiscordStreamingMessage {
     let display = this.pendingText;
     let statusLine: string;
     if (showProgress) {
-      const elapsed = this.formatElapsed(Date.now() - this.startTime);
+      const elapsed = formatElapsed(Date.now() - this.startTime);
       const current = this.toolStatus ? ` \u2014 ${this.toolStatus}` : '';
       statusLine = `\n\n*\ud83d\udd27 Working... (${this.toolCallCount} steps, ${elapsed})${current}*`;
     } else {
@@ -352,17 +454,13 @@ export class DiscordStreamingMessage {
       display = display + statusLine;
     } else {
       // No text yet — show tool status or progress as the main content
-      if (showProgress) {
-        const elapsed = this.formatElapsed(Date.now() - this.startTime);
-        const current = this.toolStatus ? ` \u2014 ${this.toolStatus}` : '';
-        display = `\u2728 *Working... (${this.toolCallCount} steps, ${elapsed})${current}*`;
-      } else {
-        display = this.toolStatus ? `\u2728 *${this.toolStatus}*` : THINKING_INDICATOR;
-      }
+      display = buildDiscordWorkCard(this.workCard);
     }
+    if (display === this.lastFlushedDisplay) return;
     try {
       await this.message.edit(display);
       this.lastFlushedText = this.pendingText;
+      this.lastFlushedDisplay = display;
       this.lastEdit = Date.now();
     } catch {
       // Discord rate limit or message deleted — ignore

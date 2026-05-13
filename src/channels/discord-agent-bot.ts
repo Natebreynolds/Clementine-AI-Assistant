@@ -36,7 +36,7 @@ import pino from 'pino';
 import type { AgentProfile } from '../types.js';
 import type { Gateway } from '../gateway/router.js';
 import type { CronScheduler } from '../gateway/cron-scheduler.js';
-import { chunkText, DiscordStreamingMessage, friendlyToolName, sanitizeResponse, rehydrateStatusEmbed, setSavedStatusEmbed } from './discord-utils.js';
+import { chunkText, DiscordStreamingMessage, sanitizeResponse, rehydrateStatusEmbed, setSavedStatusEmbed } from './discord-utils.js';
 import { MODELS } from '../config.js';
 import * as cronParser from 'cron-parser';
 
@@ -949,10 +949,10 @@ export class AgentBotClient {
         undefined, // model
         undefined, // maxTurns
         async (toolName: string, toolInput: Record<string, unknown>) => {
-          streamer.setToolStatus(friendlyToolName(toolName, toolInput));
+          streamer.recordToolActivity(toolName, toolInput);
         },
         async (status: string) => {
-          streamer.setToolStatus(status);
+          streamer.setProgressStatus(status);
         },
       );
       await streamer.finalize(response);
