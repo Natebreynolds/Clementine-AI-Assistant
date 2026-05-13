@@ -161,9 +161,20 @@ function contextOverflowFallbackMessage(): string {
 }
 
 function detectOverflowResumeReply(message: string): 'continue' | 'cancel' | 'other' {
-  const text = message.trim().toLowerCase();
+  let text = message.trim().toLowerCase().replace(/[.!?]+$/g, '').replace(/\s+/g, ' ').trim();
   if (!text) return 'other';
-  if (/^(?:continue|resume|proceed|keep going|carry on|yes|yep|yeah|sure|ok|okay|go|go ahead|do it|run it)[\s.!]*$/.test(text)) {
+  // Humans naturally add politeness around the control word. Keep this
+  // parser narrow, but do not drop a pending resume just because the owner
+  // replied "continue please" instead of the exact token "continue".
+  text = text
+    .replace(/^(?:please|pls)\s+/, '')
+    .replace(/\s+(?:please|pls)$/, '')
+    .replace(/^(?:ok|okay|yes|yep|yeah|sure),?\s+/, '')
+    .trim();
+  if (/^(?:continue|resume|proceed|keep going|carry on|yes|yep|yeah|sure|ok|okay|go|go ahead|do it|run it)$/.test(text)) {
+    return 'continue';
+  }
+  if (/^(?:continue|resume|proceed|keep going|carry on)\s+(?:from\s+(?:there|here|that state|this state)|where you left off|with\s+(?:that|it)|the work)$/.test(text)) {
     return 'continue';
   }
   if (/^(?:done|stop|cancel|abort|no|nope|that's all|that is all|leave it|do not continue|don't continue)\b/.test(text)) {

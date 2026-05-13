@@ -214,7 +214,7 @@ describe('gateway context overflow retry', () => {
     expect(response).toContain('busby@example.com');
     expect(response).toContain('Reply `continue`');
 
-    const continued = await gateway.handleMessage('discord:user:123', 'continue');
+    const continued = await gateway.handleMessage('discord:user:123', 'continue please');
     expect(continued).toBe('Salesforce cleanup complete');
     expect(mocks.runAgent).toHaveBeenCalledTimes(3);
     const continuationPrompt = mocks.runAgent.mock.calls[2]![0] as string;
