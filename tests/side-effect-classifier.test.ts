@@ -14,6 +14,7 @@ describe('side-effect classifier', () => {
   it('keeps unknown Bash in its own bucket', () => {
     expect(classifyToolCall('Bash', { command: 'ls -la' }).kind).toBe('read_only');
     expect(classifyToolCall('Bash', { command: 'sf data update record --sobject Contact --record-id 003x --values A=b' }).kind).toBe('side_effect');
+    expect(classifyToolCall('Bash', { command: 'netlify deploy --prod --dir=. --site=jacob-thompson-recruiting' }).kind).toBe('side_effect');
     expect(classifyToolCall('Bash', { command: 'node scripts/custom-workflow.js' }).kind).toBe('unknown');
   });
 
@@ -30,6 +31,11 @@ describe('side-effect classifier', () => {
     expect(isToolResultSuccessful('{"data":{"status_code":204},"error":null}')).toMatchObject({
       successful: true,
       statusCode: 204,
+    });
+    expect(isToolResultSuccessful(' ›   Error: Project not found. Please rerun "netlify link"')).toMatchObject({
+      successful: false,
+      reason: 'tool-result-error-string',
+      error: 'Project not found. Please rerun "netlify link"',
     });
   });
 });

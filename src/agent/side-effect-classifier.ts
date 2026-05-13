@@ -96,6 +96,8 @@ const BASH_SIDE_EFFECT_PATTERNS = [
   /\btee\b/i,
   /\bgit\s+(commit|push|merge|rebase|tag)\b/i,
   /\bnpm\s+(install|publish|update)\b/i,
+  /\bnetlify\s+deploy\b/i,
+  /\bvercel\s+(deploy|--prod)\b/i,
   /\b(?:sf|sfdx)\s+data\s+(update|delete|create|upsert)\b/i,
   /\b(?:sf|sfdx)\s+org\s+(create|delete)\b/i,
   /\bcurl\b.*(?:-X|--request)\s*(POST|PUT|DELETE|PATCH)\b/i,
@@ -218,9 +220,22 @@ function findError(value: unknown): string | undefined {
   return undefined;
 }
 
+function findStringError(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const text = value.trim();
+  if (!text) return undefined;
+  const firstLine = text.split(/\r?\n/).map((line) => line.trim()).find(Boolean) ?? text;
+  const prefixed = firstLine.match(/^(?:›\s*)?(?:error|failed|fatal):\s+(.+)$/i);
+  if (prefixed) return prefixed[1]?.slice(0, 500);
+  const known = text.match(/\b(Project not found\. Please rerun "netlify link"|command not found|No such file or directory|deploy failed|build failed)\b/i);
+  return known?.[1]?.slice(0, 500);
+}
+
 export function isToolResultSuccessful(rawResult: unknown, sdkIsError = false): ToolResultSuccess {
   if (sdkIsError) return { successful: false, reason: 'sdk-is-error' };
   const result = normalizeResultPayload(rawResult);
+  const stringError = findStringError(result);
+  if (stringError) return { successful: false, reason: 'tool-result-error-string', error: stringError };
   if (result && typeof result === 'object') {
     const obj = result as Record<string, unknown>;
     if (obj.is_error === true || obj.isError === true) {

@@ -224,6 +224,121 @@ describe('gateway context overflow retry', () => {
     expect(continuationPrompt).toContain('Focus on remaining follow-up');
   });
 
+  it('preserves a failed Netlify deploy across overflow and resumes without restarting discovery', async () => {
+    const assistant = fakeAssistant();
+    assistant.getSdkSessionId.mockReturnValue(null);
+    const log = new EventLog(process.env.CLEMENTINE_HOME);
+    const append = (over: Partial<RunEvent>) => log.append({
+      runId: 'run-netlify',
+      seq: 0,
+      ts: '2026-05-13T09:13:17.741Z',
+      kind: 'llm_text',
+      ...over,
+    } as RunEvent);
+
+    mocks.runAgent
+      .mockImplementationOnce(async (_prompt: string, opts: { onRunStart?: (runId: string) => void }) => {
+        opts.onRunStart?.('run-netlify');
+        append({
+          seq: 0,
+          kind: 'tool_call',
+          toolName: 'Agent',
+          toolUseId: 'agent-discovery',
+          toolInput: {
+            description: 'Find team coachies project',
+            subagent_type: 'discovery',
+            prompt: 'Find a local project related to team coachies or coaches.',
+          },
+        });
+        append({
+          seq: 1,
+          kind: 'tool_result',
+          toolUseId: 'agent-discovery',
+          toolResult: [
+            {
+              type: 'text',
+              text: [
+                'Found: 1 matching project',
+                'Path: `/Users/thompsonfamilycomputer/Desktop/Track Coaches/coach-recruiting-report.html`',
+                'No deploy.json found.',
+                'agentId: a36e4c46d6c496a79',
+              ].join('\n'),
+            },
+          ],
+        });
+        append({
+          seq: 2,
+          kind: 'tool_call',
+          toolName: 'Read',
+          toolUseId: 'read-html',
+          toolInput: {
+            file_path: '/Users/thompsonfamilycomputer/Desktop/Track Coaches/coach-recruiting-report.html',
+          },
+        });
+        append({
+          seq: 3,
+          kind: 'tool_result',
+          toolUseId: 'read-html',
+          toolResult: {
+            _clementine_guard: true,
+            tool: 'Read',
+            originalBytes: 17600,
+            capBytes: 3500,
+            bytesShed: 14100,
+            archivePath: '/Users/thompsonfamilycomputer/.clementine/tool-archive/run-netlify/Read__read-html.json',
+          },
+        });
+        append({
+          seq: 4,
+          kind: 'tool_call',
+          toolName: 'Bash',
+          toolUseId: 'netlify-fail',
+          toolInput: {
+            command: 'cd "/Users/thompsonfamilycomputer/Desktop/Track Coaches" && netlify deploy --prod --dir=. --site=jacob-thompson-recruiting 2>&1 | tail -40',
+          },
+        });
+        append({
+          seq: 5,
+          kind: 'tool_result',
+          toolUseId: 'netlify-fail',
+          toolResult: ' ›   Error: Project not found. Please rerun "netlify link"\nShell cwd was reset to /Users/thompsonfamilycomputer/.clementine',
+        });
+        throw new Error('Autocompact is thrashing');
+      })
+      .mockResolvedValueOnce(fakeRunResult('Linked the Netlify site and deployed the report.'));
+
+    const gateway = new Gateway(assistant as never) as Gateway & {
+      getAgentManager: () => unknown;
+      _maybeRouteToSpecialist: () => Promise<null>;
+    };
+    gateway.getAgentManager = vi.fn(() => null);
+    gateway._maybeRouteToSpecialist = vi.fn(async () => null);
+
+    const response = await gateway.handleMessage(
+      'discord:user:123',
+      'can you finish redesigning the team coachies html doc and then host to netlify pease',
+    );
+
+    expect(response).toContain('That run hit the context limit');
+    expect(response).toContain('Delegated work completed');
+    expect(response).toContain('Needs attention');
+    expect(response).toContain('netlify deploy --prod');
+    expect(response).toContain('Project not found. Please rerun "netlify link"');
+    expect(response).toContain('Reply `continue`');
+
+    const continued = await gateway.handleMessage('discord:user:123', 'continue');
+    expect(continued).toBe('Linked the Netlify site and deployed the report.');
+    expect(mocks.runAgent).toHaveBeenCalledTimes(2);
+    const continuationPrompt = mocks.runAgent.mock.calls[1]![0] as string;
+    expect(continuationPrompt).toContain('Failed side effects');
+    expect(continuationPrompt).toContain('netlify deploy --prod');
+    expect(continuationPrompt).toContain('Project not found. Please rerun "netlify link"');
+    expect(continuationPrompt).toContain('Do not repeat discovery/research');
+    expect(continuationPrompt).toContain('Find team coachies project');
+    expect(continuationPrompt).toContain('Original owner request');
+    expect(continuationPrompt).toContain('can you finish redesigning the team coachies html doc');
+  });
+
   it('retries with fresh SDK session when overflow happens on a resumed session (1.18.196)', async () => {
     // 1.18.196 — SDK session JSONLs can grow to 80+MB after months of
     // chat. Resuming one of those blows context on the first user

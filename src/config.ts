@@ -639,9 +639,10 @@ export const TOOL_OUTPUT_GUARD = {
   ),
   adaptive: boolEnv('TOOL_OUTPUT_GUARD_ADAPTIVE', json.toolOutputGuard?.adaptive, true),
   // Agent results are especially dangerous: even a "medium" subagent report
-  // refills the parent orchestrator after compaction. Keep the handoff tight;
+  // refills the parent orchestrator after compaction. Full-file `Read` calls
+  // are the same failure class for generated HTML/reports. Keep both tight;
   // the full result is archived by tool-output-guard.
-  perTool: { Agent: 4_000, ...(json.toolOutputGuard?.perTool ?? {}) } as Record<string, number>,
+  perTool: { Agent: 4_000, Read: 10_000, ...(json.toolOutputGuard?.perTool ?? {}) } as Record<string, number>,
 };
 
 export const DEFAULT_MODEL_TIER = (getEnvOrJson('DEFAULT_MODEL_TIER', json.models?.default, 'sonnet')) as keyof Models;

@@ -274,6 +274,11 @@ function extractProviderLogId(raw: unknown): string | undefined {
 }
 
 function statusPhrase(call: SideEffectCall): string {
+  if (call.result && !call.result.successful) {
+    const error = call.result.error ? `: ${call.result.error}` : '';
+    const status = call.result.statusCode ? ` (${call.result.statusCode})` : '';
+    return `failed${status}${error}`.slice(0, 260);
+  }
   const status = call.result?.statusCode;
   if (status && toolKindLabel(call.toolName) === 'email sends') return `accepted (${status})`;
   if (status) return `succeeded (${status})`;
@@ -352,8 +357,18 @@ export function formatOverflowRecoveryMessage(summary: RunSummary): string {
     || summary.pendingDelegations.length > 0
   ) {
     lines.push('Needs attention:');
-    if (summary.failedSideEffects.length > 0) lines.push(...formatGroupedLines('failed', summary.failedSideEffects));
-    if (summary.pendingSideEffects.length > 0) lines.push(...formatGroupedLines('started, no confirmation', summary.pendingSideEffects));
+    if (summary.failedSideEffects.length > 0) {
+      for (const call of summary.failedSideEffects.slice(0, 5)) lines.push(formatDetailedCall(call));
+      if (summary.failedSideEffects.length > 5) {
+        lines.push(`- ...and ${summary.failedSideEffects.length - 5} more failed side effects`);
+      }
+    }
+    if (summary.pendingSideEffects.length > 0) {
+      for (const call of summary.pendingSideEffects.slice(0, 5)) lines.push(formatDetailedCall(call));
+      if (summary.pendingSideEffects.length > 5) {
+        lines.push(`- ...and ${summary.pendingSideEffects.length - 5} more side effects started with no confirmation`);
+      }
+    }
     for (const call of summary.failedDelegations.slice(0, 5)) lines.push(formatDelegationCall(call, 'failed'));
     for (const call of summary.pendingDelegations.slice(0, 5)) lines.push(formatDelegationCall(call, 'started, no confirmation'));
     if (summary.unknownEffectCalls.length > 0) lines.push(`- ${summary.unknownEffectCalls.length} tool call(s) had unknown external effect`);
@@ -371,10 +386,14 @@ function formatDetailedCall(call: SideEffectCall): string {
   const recipients = extractRecipients(call.input);
   const subject = extractSubject(call.input);
   const filePath = extractFilePath(call.input, call.result?.raw);
+  const command = call.toolName === 'Bash'
+    ? firstString(call.input.command)?.replace(/\s+/g, ' ').slice(0, 180)
+    : undefined;
   const logId = call.result ? extractProviderLogId(call.result.raw) : undefined;
   const parts = [
     toolKindLabel(call.toolName),
     filePath ? `file ${filePath}` : undefined,
+    command ? `command "${command}"` : undefined,
     recipients.length ? `to ${recipients.join(', ')}` : undefined,
     subject ? `subject "${subject}"` : undefined,
     call.result ? statusPhrase(call) : 'started, no confirmation',

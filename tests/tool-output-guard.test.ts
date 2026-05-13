@@ -61,7 +61,7 @@ describe('adaptiveSoftCap', () => {
 
 describe('resolveCap', () => {
   it('uses the default soft cap when no per-tool override', () => {
-    const r = resolveCap('Read', defaultGuardConfig(), 0);
+    const r = resolveCap('Bash', defaultGuardConfig(), 0);
     expect(r.softCap).toBe(defaultGuardConfig().softLimitBytes);
   });
 
@@ -74,6 +74,11 @@ describe('resolveCap', () => {
   it('uses a tight default cap for Agent results', () => {
     const r = resolveCap('Agent', defaultGuardConfig(), 0);
     expect(r.softCap).toBeLessThanOrEqual(6_000);
+  });
+
+  it('uses a tighter default cap for full-file Read results', () => {
+    const r = resolveCap('Read', defaultGuardConfig(), 0.8);
+    expect(r.softCap).toBeLessThanOrEqual(4_000);
   });
 
   it('never returns a soft cap above the hard ceiling', () => {

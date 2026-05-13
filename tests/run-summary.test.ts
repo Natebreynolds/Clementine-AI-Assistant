@@ -110,10 +110,29 @@ describe('run summary', () => {
           },
         ],
       }));
+      log.append(ev({
+        runId: 'run-b',
+        seq: 7,
+        kind: 'tool_call',
+        toolName: 'Bash',
+        toolUseId: 'netlify-fail',
+        toolInput: {
+          command: 'cd "/tmp/Track Coaches" && netlify deploy --prod --dir=. --site=jacob-thompson-recruiting 2>&1 | tail -40',
+        },
+      }));
+      log.append(ev({
+        runId: 'run-b',
+        seq: 8,
+        kind: 'tool_result',
+        toolUseId: 'netlify-fail',
+        toolResult: ' ›   Error: Project not found. Please rerun "netlify link"\nShell cwd was reset',
+      }));
 
       const summary = summarizeRunSideEffects(['run-a', 'run-b'], log);
       expect(summary.successfulSideEffects).toHaveLength(2);
       expect(summary.successfulSideEffects[0].result?.statusCode).toBe(202);
+      expect(summary.failedSideEffects).toHaveLength(1);
+      expect(summary.failedSideEffects[0].result?.error).toBe('Project not found. Please rerun "netlify link"');
       expect(summary.successfulDelegations).toHaveLength(1);
       expect(summary.readOnlyCount).toBe(1);
       expect(summary.unknownEffectCalls).toHaveLength(1);
@@ -124,6 +143,8 @@ describe('run summary', () => {
       expect(message).toContain('kevin@example.com');
       expect(message).toContain('Delegated work completed');
       expect(message).toContain('/tmp/full-agent-result.json');
+      expect(message).toContain('netlify deploy --prod');
+      expect(message).toContain('Project not found. Please rerun "netlify link"');
       expect(message).toContain('unknown external effect');
 
       const prompt = buildContinuationPrompt(summary, 'fire off those emails');
@@ -134,6 +155,9 @@ describe('run summary', () => {
       expect(prompt).toContain('logId log_123');
       expect(prompt).toContain('Do not repeat discovery/research');
       expect(prompt).toContain('Map Track Coaches project');
+      expect(prompt).toContain('Failed side effects');
+      expect(prompt).toContain('netlify deploy --prod');
+      expect(prompt).toContain('Project not found. Please rerun "netlify link"');
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
